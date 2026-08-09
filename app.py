@@ -12,10 +12,10 @@ from typing import Any
 
 import requests
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-APP_NAME = "Football Edge v5.5"
+APP_NAME = "Football Edge v5.6"
 BASE_DIR = Path(__file__).resolve().parent
 
 THESPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json/123"
@@ -65,7 +65,7 @@ UA = (
 CACHE: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 600
 
-app = FastAPI(title=APP_NAME, version="5.5")
+app = FastAPI(title=APP_NAME, version="5.6")
 
 
 class AnalyzeRequest(BaseModel):
@@ -165,6 +165,7 @@ def recursive_dicts(obj: Any):
 ESPN_KNOWN = {
     "denmark": TeamRef("479", "Denmark", "espn", [], {"league": "all"}),
     "norway": TeamRef("464", "Norway", "espn", [], {"league": "all"}),
+    "spain": TeamRef("164", "Spain", "espn", [], {"league": "all"}),
 }
 
 
@@ -846,30 +847,36 @@ def collect_best_events(team_refs: list[TeamRef], n=20):
     best_events = []
 
     for ref in team_refs:
-        if ref.provider == "football-data":
-            events = fd_team_events(ref, n)
-        elif ref.provider == "espn":
-            events = espn_team_events(ref, n)
-        elif ref.provider == "thesportsdb":
-            events = tsdb_team_events(ref, n)
-        else:
-            events = fotmob_team_events(ref, n)
+        events = []
+        provider_error = None
+
+        try:
+            if ref.provider == "football-data":
+                events = fd_team_events(ref, n)
+            elif ref.provider == "espn":
+                events = espn_team_events(ref, n)
+            elif ref.provider == "thesportsdb":
+                events = tsdb_team_events(ref, n)
+            else:
+                events = fotmob_team_events(ref, n)
+        except Exception as e:
+            # A single provider must never crash the whole analysis request.
+            provider_error = f"{type(e).__name__}: {str(e)[:180]}"
+            events = []
 
         diagnostics.append({
             "provider": ref.provider,
             "team": ref.name,
             "team_id": ref.id,
             "events": len(events),
+            "error": provider_error,
         })
 
         if len(events) > len(best_events):
             best_ref = ref
             best_events = events
 
-        # Prefer the first provider that can satisfy the requested sample.
-        # Otherwise keep trying fallbacks and retain whichever provider yields
-        # the largest usable history.
-        if len(events) >= n:
+        if len(events) >= n or (ref.provider == "espn" and len(events) >= 5):
             break
 
     return best_ref, best_events, diagnostics
@@ -1211,6 +1218,20 @@ def debug_team(team_name: str):
     }
 
 
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc):
+    # Always return JSON so the frontend never receives an HTML/plain-text 500.
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": (
+                "伺服器分析時發生未預期錯誤："
+                f"{type(exc).__name__}: {str(exc)[:220]}"
+            )
+        },
+    )
+
+
 @app.get("/")
 def index():
     return FileResponse(BASE_DIR / "static" / "index.html")
@@ -1221,7 +1242,7 @@ def health():
     return {
         "ok": True,
         "app": APP_NAME,
-        "version": "5.5",
+        "version": "5.6",
         "providers": {
             "football-data": bool(FOOTBALL_DATA_API_KEY),
             "espn": True,
@@ -1238,8 +1259,21 @@ def analyze(req: AnalyzeRequest):
 
     n = max(5, min(req.recent_matches, 20))
 
-    home_refs = resolve_team(req.home_team)
-    away_refs = resolve_team(req.away_team)
+    try:
+        home_refs = resolve_team(req.home_team)
+    except Exception as e:
+        raise HTTPException(
+            502,
+            detail=f"主隊搜尋失敗：{type(e).__name__}: {str(e)[:160]}"
+        )
+
+    try:
+        away_refs = resolve_team(req.away_team)
+    except Exception as e:
+        raise HTTPException(
+            502,
+            detail=f"客隊搜尋失敗：{type(e).__name__}: {str(e)[:160]}"
+        )
 
     if not home_refs:
         raise HTTPException(404, detail=f"找不到主隊「{req.home_team}」。")
@@ -1259,9 +1293,13 @@ def analyze(req: AnalyzeRequest):
 
     if len(hr) < 3 or len(ar) < 3:
         def _diag_text(rows):
-            return ", ".join(
-                f"{x['provider']}={x['events']}場" for x in rows
-            ) or "無"
+            parts = []
+            for x in rows:
+                s = f"{x['provider']}={x['events']}場"
+                if x.get("error"):
+                    s += f"(錯誤:{x['error']})"
+                parts.append(s)
+            return ", ".join(parts) or "無"
         raise HTTPException(
             422,
             detail=(
@@ -1323,9 +1361,8 @@ def analyze(req: AnalyzeRequest):
             "source_away": away.provider,
             "football_data_enabled": bool(FOOTBALL_DATA_API_KEY),
             "note": (
-                "v5.5 provider router: football-data.org when configured, then ESPN "
-                "all-competitions team schedule with schedule-compatible parser, "
-                "TheSportsDB, then FotMob fallback."
+                "v5.6 stable provider router: provider failures are isolated, "
+                "ESPN all-competitions schedule is primary, then TheSportsDB and FotMob fallback."
             ),
         },
     }
