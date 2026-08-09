@@ -1,0 +1,15 @@
+Football Edge v5 - First deployment
+
+You do NOT open index.html.
+You do NOT run HTA.
+You do NOT install Python.
+
+Deploy once:
+1. Upload this project to GitHub.
+2. Render -> New -> Blueprint.
+3. Select the repository.
+4. Wait for deployment.
+5. Save the public https URL.
+
+After that:
+Open URL -> enter teams -> analyze.
