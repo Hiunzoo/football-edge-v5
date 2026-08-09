@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-APP_NAME = "Football Edge v6 Dynamic Resolver"
+APP_NAME = "Football Edge v6.1 Universal Collector"
 BASE_DIR = Path(__file__).resolve().parent
 
 THESPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json/123"
@@ -65,7 +65,7 @@ UA = (
 CACHE: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 600
 
-app = FastAPI(title=APP_NAME, version="6.0")
+app = FastAPI(title=APP_NAME, version="6.1")
 
 
 class AnalyzeRequest(BaseModel):
@@ -534,30 +534,43 @@ def _dedupe_events(events: list[dict]) -> list[dict]:
 
 
 def espn_all_schedule_events(team: TeamRef, n=20) -> list[dict]:
-    """Fetch completed results from ESPN's all-competitions team schedule."""
+    """Fetch completed results from ESPN across multiple seasons.
+
+    Club and national-team schedule endpoints do not always return the same
+    amount of history without a season parameter, so aggregate several seasons
+    before falling back to other providers.
+    """
     events = []
+    now = datetime.now()
 
     urls = [
         f"{ESPN_BASE}/all/teams/{team.id}/schedule",
         f"{ESPN_WEB_BASE}/all/teams/{team.id}/schedule",
     ]
 
+    param_sets = [{}]
+    for season in range(now.year, now.year - 5, -1):
+        param_sets.append({"season": season})
+
     for url in urls:
-        try:
-            data = http_json(url)
-        except RuntimeError:
-            continue
+        for params in param_sets:
+            try:
+                data = http_json(url, params=params)
+            except RuntimeError:
+                continue
 
-        for raw in data.get("events") or []:
-            e = parse_espn_event(raw, "ESPN All Competitions")
-            if e and _team_name_matches_event(e, team):
-                events.append(e)
+            for raw in data.get("events") or []:
+                e = parse_espn_event(raw, "ESPN All Competitions")
+                if e and _team_name_matches_event(e, team):
+                    events.append(e)
 
-        events = _dedupe_events(events)
-        if len(events) >= min(n, 8):
+            events = _dedupe_events(events)
+            if len(events) >= max(n, 15):
+                break
+        if len(events) >= max(n, 15):
             break
 
-    return events[:max(n, 30)]
+    return events[:max(n, 40)]
 
 
 def espn_team_events(team: TeamRef, n=20) -> list[dict]:
@@ -940,6 +953,50 @@ def fotmob_team_events(team: TeamRef, n=20) -> list[dict]:
     return out[:max(n, 20)]
 
 
+def _event_date_key(e: dict) -> str:
+    raw = str(e.get("date") or "")
+    m = re.search(r"\d{4}-\d{2}-\d{2}", raw)
+    if m:
+        return m.group(0)
+    m = re.search(r"\d{8}", raw)
+    if m:
+        s = m.group(0)
+        return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+    return raw[:10]
+
+
+def _same_event(a: dict, b: dict) -> bool:
+    if _event_date_key(a) != _event_date_key(b):
+        return False
+    if a.get("home_score") != b.get("home_score") or a.get("away_score") != b.get("away_score"):
+        return False
+    return (
+        sim(a.get("home"), b.get("home")) >= .78
+        and sim(a.get("away"), b.get("away")) >= .78
+    )
+
+
+def merge_provider_events(event_groups: list[list[dict]]) -> list[dict]:
+    """Merge histories from different providers without double-counting games."""
+    merged: list[dict] = []
+    for group in event_groups:
+        for e in group:
+            if e.get("home_score") is None or e.get("away_score") is None:
+                continue
+            if any(_same_event(e, old) for old in merged):
+                continue
+            merged.append(e)
+    merged.sort(key=lambda x: (x.get("date") or ""), reverse=True)
+    return merged
+
+
+def canonical_team_ref(team_refs: list[TeamRef]) -> TeamRef | None:
+    if not team_refs:
+        return None
+    priority = {"espn": 0, "football-data": 1, "thesportsdb": 2, "fotmob": 3}
+    return sorted(team_refs, key=lambda r: priority.get(r.provider, 9))[0]
+
+
 # -----------------------------
 # Provider router
 # -----------------------------
@@ -976,28 +1033,32 @@ def resolve_team(query: str) -> list[TeamRef]:
 
 
 def collect_best_events(team_refs: list[TeamRef], n=20):
+    """Collect from every resolved provider, then merge and deduplicate.
+
+    This is intentionally different from the old 'pick the provider with the
+    most rows' strategy. A requested recent-10 sample can now be assembled from
+    ESPN + TheSportsDB + FotMob + football-data when necessary.
+    """
     diagnostics = []
-    best_ref = None
-    best_events = []
+    groups: list[list[dict]] = []
 
     for ref in team_refs:
         events = []
         provider_error = None
-
         try:
             if ref.provider == "football-data":
-                events = fd_team_events(ref, n)
+                events = fd_team_events(ref, max(n, 20))
             elif ref.provider == "espn":
-                events = espn_team_events(ref, n)
+                events = espn_team_events(ref, max(n, 20))
             elif ref.provider == "thesportsdb":
-                events = tsdb_team_events(ref, n)
+                events = tsdb_team_events(ref, max(n, 20))
             else:
-                events = fotmob_team_events(ref, n)
+                events = fotmob_team_events(ref, max(n, 20))
         except Exception as e:
-            # A single provider must never crash the whole analysis request.
             provider_error = f"{type(e).__name__}: {str(e)[:180]}"
             events = []
 
+        groups.append(events)
         diagnostics.append({
             "provider": ref.provider,
             "team": ref.name,
@@ -1006,14 +1067,18 @@ def collect_best_events(team_refs: list[TeamRef], n=20):
             "error": provider_error,
         })
 
-        if len(events) > len(best_events):
-            best_ref = ref
-            best_events = events
+    merged = merge_provider_events(groups)
+    canonical = canonical_team_ref(team_refs)
 
-        if len(events) >= n or (ref.provider == "espn" and len(events) >= 5):
-            break
+    diagnostics.append({
+        "provider": "merged",
+        "team": canonical.name if canonical else "",
+        "team_id": "",
+        "events": len(merged),
+        "error": None,
+    })
 
-    return best_ref, best_events, diagnostics
+    return canonical, merged[:max(n, 40)], diagnostics
 
 
 # -----------------------------
@@ -1024,15 +1089,15 @@ def belongs(e, t: TeamRef):
     return (
         str(e.get("home_id") or "") == str(t.id)
         or str(e.get("away_id") or "") == str(t.id)
-        or sim(e.get("home"), t.name) > .88
-        or sim(e.get("away"), t.name) > .88
+        or sim(e.get("home"), t.name) > .76
+        or sim(e.get("away"), t.name) > .76
     )
 
 
 def versus(e, a: TeamRef, b: TeamRef):
     return (
-        max(sim(e.get("home"), a.name), sim(e.get("away"), a.name)) > .88
-        and max(sim(e.get("home"), b.name), sim(e.get("away"), b.name)) > .88
+        max(sim(e.get("home"), a.name), sim(e.get("away"), a.name)) > .76
+        and max(sim(e.get("home"), b.name), sim(e.get("away"), b.name)) > .76
     )
 
 
@@ -1047,7 +1112,7 @@ def team_stats(events, team, venue=None):
     for e in events:
         is_home = (
             str(e.get("home_id") or "") == str(team.id)
-            or sim(e.get("home"), team.name) > .88
+            or sim(e.get("home"), team.name) > .76
         )
         if venue == "home" and not is_home:
             continue
@@ -1373,7 +1438,7 @@ def health():
     return {
         "ok": True,
         "app": APP_NAME,
-        "version": "6.0",
+        "version": "6.1",
         "providers": {
             "football-data": bool(FOOTBALL_DATA_API_KEY),
             "espn": True,
@@ -1434,7 +1499,7 @@ def analyze(req: AnalyzeRequest):
         raise HTTPException(
             422,
             detail=(
-                f"資料不足，至少需要每隊 3 場才能產生預測。"
+                f"合併所有可用資料源後仍不足，至少需要每隊 3 場才能產生預測。"
                 f" 目前 {home.name} {len(hr)} 場、{away.name} {len(ar)} 場。"
                 f" 主隊來源：{_diag_text(home_diag)}；"
                 f"客隊來源：{_diag_text(away_diag)}。"
@@ -1494,7 +1559,7 @@ def analyze(req: AnalyzeRequest):
             "source_away": away.provider,
             "football_data_enabled": bool(FOOTBALL_DATA_API_KEY),
             "note": (
-                "v6 Dynamic Resolver: arbitrary team names are resolved dynamically through "
+                "v6.1 Universal Collector: arbitrary team names are resolved dynamically through "
                 "ESPN global search/team catalogues, then schedules are fetched automatically. "
                 "TheSportsDB, FotMob and football-data.org remain provider fallbacks."
             ),
