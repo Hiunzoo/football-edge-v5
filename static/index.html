@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Football Edge v6.1.2</title>
+<title>Football Edge v7</title>
 <style>
 :root{--bg:#07111d;--panel:#0d1c2b;--line:#20384f;--text:#f4f8fc;--muted:#91a8bd;--green:#31db8b;--blue:#63a8ff;--amber:#ffc45e}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,#15304b 0,#07111d 38%);color:var(--text);font-family:Inter,"Noto Sans TC","Segoe UI",sans-serif}
@@ -29,18 +29,18 @@ table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;border-bottom:1
 </head>
 <body>
 <main class="wrap">
-<div class="top"><div class="brand">Football <span>Edge v5</span></div><div class="badge">UNIVERSAL COLLECTOR v6.1</div></div>
+<div class="top"><div class="brand">Football <span>Edge v5</span></div><div class="badge">POWER MODEL v7</div></div>
 <h1>輸入兩隊，直接做完整賽前分析。</h1>
 <div class="sub">支援俱樂部與國家隊。伺服器會自動搜尋球隊、抓近期賽果與歷史交手，再用主客場權重與 Dixon–Coles Poisson 模型計算勝平負與最可能比分。</div>
 
 <div class="search">
-  <input id="home" value="Denmark" placeholder="主隊，例如 Denmark">
-  <span class="vs">VS</span>
-  <input id="away" value="Norway" placeholder="客隊，例如 Norway">
+  <input id="home" list="homeSuggestions" autocomplete="off" value="Denmark" placeholder="主隊，例如 Denmark">
+  <datalist id="homeSuggestions"></datalist><span class="vs">VS</span><datalist id="awaySuggestions"></datalist>
+  <input id="away" list="awaySuggestions" autocomplete="off" value="Norway" placeholder="客隊，例如 Norway">
   <select id="recent"><option value="5">近 5 場</option><option value="10" selected>近 10 場</option><option value="15">近 15 場</option><option value="20">近 20 場</option></select>
   <button id="analyze">開始分析</button>
 </div>
-<div class="hint">v6.1 會自動解析球隊，跨 ESPN、TheSportsDB、FotMob 與可用正式 API 收集多年度賽事，合併去重後取真正最近場次。</div>
+<div class="hint">輸入常用隊名即可，例如 Liverpool、Man City、PSG；系統會自動比對正式球隊名稱；v7 會再用對手強度修正近期戰績，避免只靠近況高估球隊。<br>v7 會自動解析球隊，跨 ESPN、TheSportsDB、FotMob 與可用正式 API 收集多年度賽事，合併去重後取真正最近場次。</div>
 <div id="status" class="status"></div>
 
 <div id="results" class="hidden">
@@ -75,7 +75,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;border-bottom:1
   <section class="section"><div id="summary" class="callout"></div><div class="callout warn">模型是統計估計，不代表確定比分。先發、傷停、紅牌、賽程與戰術變化都可能改變結果。</div></section>
 </div>
 
-<div class="footer">Football Edge v6.1.2 · FotMob public web JSON adapter · non-official data source</div>
+<div class="footer">Football Edge v7 · FotMob public web JSON adapter · non-official data source</div>
 </main>
 
 <script>
@@ -87,8 +87,47 @@ function formHtml(f){return(f||[]).slice(0,5).map(x=>`<i class="${x}">${x}</i>`)
 function dateText(s){if(!s)return"—";const d=new Date(s);return isNaN(d)?String(s).slice(0,10):d.toLocaleDateString("zh-TW")}
 function gameHtml(e){return`<div class="game"><div><div>${esc(e.home)} vs ${esc(e.away)}</div><small>${esc(dateText(e.date))} · ${esc(e.competition||"—")}</small></div><b>${e.home_score}–${e.away_score}</b></div>`}
 
+
+const teamPick={home:null,away:null};
+let teamSearchTimer={home:null,away:null};
+
+function teamOptionText(x){
+  const p=x.provider?` · ${x.provider}`:"";
+  return `${x.name}${p}`;
+}
+
+async function searchTeam(kind){
+  const input=$(kind), q=input.value.trim();
+  if(q.length<2)return;
+  try{
+    const r=await fetch(`/api/team-search?q=${encodeURIComponent(q)}&limit=6`);
+    if(!r.ok)return;
+    const d=await r.json();
+    const list=$(`${kind}Suggestions`);
+    list.innerHTML=(d.results||[]).map(x=>`<option value="${esc(x.name)}">${esc(teamOptionText(x))}</option>`).join("");
+    teamPick[kind]=d.auto_select||null;
+    if(d.auto_select && d.auto_select.name){
+      input.dataset.resolved=d.auto_select.name;
+    }else{
+      delete input.dataset.resolved;
+    }
+  }catch(e){}
+}
+
+["home","away"].forEach(kind=>{
+  const el=$(kind);
+  el.addEventListener("input",()=>{
+    teamPick[kind]=null;
+    clearTimeout(teamSearchTimer[kind]);
+    teamSearchTimer[kind]=setTimeout(()=>searchTeam(kind),300);
+  });
+  el.addEventListener("change",()=>{
+    searchTeam(kind);
+  });
+});
+
 async function analyze(){
-  const home=$("home").value.trim(),away=$("away").value.trim(),recent=Number($("recent").value);
+  const home=($("home").dataset.resolved||$("home").value).trim(),away=($("away").dataset.resolved||$("away").value).trim(),recent=Number($("recent").value);
   if(!home||!away){status("請輸入兩支球隊。","err");return}
   $("analyze").disabled=true;$("results").classList.add("hidden");status("正在搜尋球隊、抓近期賽事並計算模型…","load");
   try{
@@ -121,6 +160,11 @@ function render(d){
   $("h2hRows").innerHTML=d.h2h.length?d.h2h.map(e=>`<tr><td>${esc(dateText(e.date))}</td><td>${esc(e.competition||"—")}</td><td>${esc(e.home)}</td><td><b>${e.home_score}–${e.away_score}</b></td><td>${esc(e.away)}</td></tr>`).join(""):`<tr><td colspan="5">目前可取得歷史範圍內沒有直接交手。</td></tr>`;
   $("homeRecentTitle").textContent=h.name;$("awayRecentTitle").textContent=a.name;
   $("homeRecent").innerHTML=d.recent.home.slice(0,10).map(gameHtml).join("");$("awayRecent").innerHTML=d.recent.away.slice(0,10).map(gameHtml).join("");
+  if($("powerHome")){
+    $("powerHome").textContent=p.power?.home?.rating ?? "--";
+    $("powerAway").textContent=p.power?.away?.rating ?? "--";
+    $("powerDiff").textContent=(p.power?.difference>0?"+":"")+(p.power?.difference ?? "--");
+  }
   const best=p.top_scores[0];
   const q=p.sample_quality==="normal"?"正常":(p.sample_quality==="medium"?"中等":"偏低");
   $("summary").innerHTML=`<b>模型摘要：</b>${esc(h.name)} 近況場均進球 ${hs.gf_avg}、失球 ${hs.ga_avg}；${esc(a.name)} 場均進球 ${as.gf_avg}、失球 ${as.ga_avg}。目前最高單一比分為 <b>${best.home}–${best.away}</b>（${pct(best.probability)}）。樣本品質：<b>${q}</b>（${p.sample_counts.home} vs ${p.sample_counts.away} 場）。`;
