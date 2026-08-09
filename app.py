@@ -15,12 +15,33 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-APP_NAME = "Football Edge v5.1"
+APP_NAME = "Football Edge v5.1.1"
 BASE_DIR = Path(__file__).resolve().parent
 
 THESPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json/123"
 FOTMOB_BASE = "https://www.fotmob.com/api"
 FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
+ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer"
+
+# Curated ESPN soccer competitions. The same ESPN team ID is often reusable
+# across competitions, so we can combine schedules from multiple competitions.
+ESPN_LEAGUES = [
+    "uefa.nations",
+    "fifa.world",
+    "fifa.worldq.uefa",
+    "fifa.friendly",
+    "uefa.euro",
+    "uefa.champions",
+    "uefa.europa",
+    "eng.1",
+    "esp.1",
+    "ger.1",
+    "ita.1",
+    "fra.1",
+    "ned.1",
+    "por.1",
+    "usa.1",
+]
 FOOTBALL_DATA_API_KEY = os.getenv("FOOTBALL_DATA_API_KEY", "").strip()
 
 UA = (
@@ -31,7 +52,7 @@ UA = (
 CACHE: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 600
 
-app = FastAPI(title=APP_NAME, version="5.1")
+app = FastAPI(title=APP_NAME, version="5.1.1")
 
 
 class AnalyzeRequest(BaseModel):
@@ -122,6 +143,173 @@ def recursive_dicts(obj: Any):
     elif isinstance(obj, list):
         for item in obj:
             yield from recursive_dicts(item)
+
+
+# -----------------------------
+# ESPN public soccer API
+# -----------------------------
+
+ESPN_KNOWN = {
+    "denmark": TeamRef("479", "Denmark", "espn", [], {"league": "uefa.nations"}),
+    "norway": TeamRef("464", "Norway", "espn", [], {"league": "uefa.nations"}),
+}
+
+
+def _espn_team_rows(payload: Any):
+    rows = []
+    sports = payload.get("sports") or []
+    for sport in sports:
+        for league in sport.get("leagues") or []:
+            for item in league.get("teams") or []:
+                team = item.get("team") or item
+                if isinstance(team, dict):
+                    rows.append(team)
+    if payload.get("teams"):
+        for item in payload["teams"]:
+            team = item.get("team") if isinstance(item, dict) else None
+            rows.append(team or item)
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def espn_search_team(query: str) -> TeamRef | None:
+    known = ESPN_KNOWN.get(norm(query))
+    if known:
+        return known
+
+    best = None
+    best_score = 0.0
+    best_league = None
+
+    for league in ESPN_LEAGUES:
+        try:
+            data = http_json(f"{ESPN_BASE}/{league}/teams")
+        except RuntimeError:
+            continue
+
+        for t in _espn_team_rows(data):
+            names = [
+                t.get("displayName"),
+                t.get("name"),
+                t.get("shortDisplayName"),
+                t.get("abbreviation"),
+            ]
+            score = max([sim(query, n) for n in names if n] or [0])
+            if score > best_score:
+                raw_id = t.get("id")
+                name = t.get("displayName") or t.get("name")
+                if raw_id is not None and name:
+                    best = TeamRef(str(raw_id), str(name), "espn", [], {"league": league})
+                    best_score = score
+                    best_league = league
+
+        if best_score >= .96:
+            break
+
+    return best if best_score >= .56 else None
+
+
+def parse_espn_event(raw: dict, league: str) -> dict | None:
+    comps = raw.get("competitions") or []
+    if not comps:
+        return None
+    comp = comps[0]
+    status = ((raw.get("status") or {}).get("type") or {})
+    completed = status.get("completed")
+    state = str(status.get("state") or "").lower()
+    if completed is not True and state not in ("post", "final"):
+        return None
+
+    competitors = comp.get("competitors") or []
+    home = away = None
+    for c in competitors:
+        ha = str(c.get("homeAway") or "").lower()
+        if ha == "home":
+            home = c
+        elif ha == "away":
+            away = c
+    if not home or not away:
+        return None
+
+    ht = home.get("team") or {}
+    at = away.get("team") or {}
+    hs = home.get("score")
+    aas = away.get("score")
+    try:
+        hs = int(float(hs))
+        aas = int(float(aas))
+    except (TypeError, ValueError):
+        return None
+
+    league_name = None
+    l = raw.get("league") or {}
+    if isinstance(l, dict):
+        league_name = l.get("name") or l.get("abbreviation")
+    league_name = league_name or league
+
+    return {
+        "id": raw.get("id"),
+        "date": raw.get("date"),
+        "home": ht.get("displayName") or ht.get("name") or "",
+        "away": at.get("displayName") or at.get("name") or "",
+        "home_id": str(ht.get("id") or ""),
+        "away_id": str(at.get("id") or ""),
+        "home_score": hs,
+        "away_score": aas,
+        "competition": league_name,
+        "source": "ESPN",
+    }
+
+
+def espn_team_events(team: TeamRef, n=20) -> list[dict]:
+    events = []
+    seen = set()
+    current_year = datetime.now().year
+
+    preferred = []
+    if team.alt_ids and team.alt_ids.get("league"):
+        preferred.append(team.alt_ids["league"])
+    leagues = preferred + [x for x in ESPN_LEAGUES if x not in preferred]
+
+    # For national teams we combine multiple competitions because a team's
+    # recent matches can span World Cup, qualifiers, friendlies and Nations League.
+    for league in leagues:
+        for season in (current_year, current_year - 1):
+            try:
+                data = http_json(
+                    f"{ESPN_BASE}/{league}/teams/{team.id}/schedule",
+                    params={"season": season},
+                )
+            except RuntimeError:
+                continue
+
+            found_for_league = 0
+            for raw in data.get("events") or []:
+                e = parse_espn_event(raw, league)
+                if not e:
+                    continue
+                # ESPN team IDs can occasionally differ between competition
+                # namespaces, so retain a name-based verification too.
+                if (
+                    str(e["home_id"]) != str(team.id)
+                    and str(e["away_id"]) != str(team.id)
+                    and sim(e["home"], team.name) < .88
+                    and sim(e["away"], team.name) < .88
+                ):
+                    continue
+                key = e["id"] or (e["date"], e["home"], e["away"])
+                if key not in seen:
+                    seen.add(key)
+                    events.append(e)
+                    found_for_league += 1
+
+            # Do not unnecessarily hit every past season once enough data exists.
+            if len(events) >= max(n, 12):
+                break
+        if len(events) >= max(n, 12):
+            break
+
+    events.sort(key=lambda x: x.get("date") or "", reverse=True)
+    return events[:max(n, 25)]
 
 
 # -----------------------------
@@ -477,6 +665,10 @@ def resolve_team(query: str) -> list[TeamRef]:
     if fd:
         refs.append(fd)
 
+    ep = espn_search_team(query)
+    if ep:
+        refs.append(ep)
+
     ts = tsdb_search_team(query)
     if ts:
         refs.append(ts)
@@ -504,6 +696,8 @@ def collect_best_events(team_refs: list[TeamRef], n=20):
     for ref in team_refs:
         if ref.provider == "football-data":
             events = fd_team_events(ref, n)
+        elif ref.provider == "espn":
+            events = espn_team_events(ref, n)
         elif ref.provider == "thesportsdb":
             events = tsdb_team_events(ref, n)
         else:
@@ -716,9 +910,10 @@ def health():
     return {
         "ok": True,
         "app": APP_NAME,
-        "version": "5.1",
+        "version": "5.1.1",
         "providers": {
             "football-data": bool(FOOTBALL_DATA_API_KEY),
+            "espn": True,
             "thesportsdb": True,
             "fotmob_fallback": True,
         },
@@ -752,16 +947,18 @@ def analyze(req: AnalyzeRequest):
     ar = recent(away_all, away, n)
 
     if len(hr) < 3 or len(ar) < 3:
+        def _diag_text(rows):
+            return ", ".join(
+                f"{x['provider']}={x['events']}場" for x in rows
+            ) or "無"
         raise HTTPException(
             422,
-            detail={
-                "message": (
-                    f"目前可取得的近期賽事仍不足："
-                    f"{home.name} {len(hr)} 場、{away.name} {len(ar)} 場。"
-                ),
-                "home_providers": home_diag,
-                "away_providers": away_diag,
-            },
+            detail=(
+                f"目前可取得的近期賽事仍不足："
+                f"{home.name} {len(hr)} 場、{away.name} {len(ar)} 場。"
+                f" 主隊來源：{_diag_text(home_diag)}；"
+                f"客隊來源：{_diag_text(away_diag)}。"
+            ),
         )
 
     union = []
@@ -813,8 +1010,8 @@ def analyze(req: AnalyzeRequest):
             "source_away": away.provider,
             "football_data_enabled": bool(FOOTBALL_DATA_API_KEY),
             "note": (
-                "v5.1 provider router: football-data.org when configured, "
-                "then TheSportsDB, then FotMob fallback."
+                "v5.1.1 provider router: football-data.org when configured, "
+                "then ESPN, TheSportsDB, then FotMob fallback."
             ),
         },
     }
