@@ -1,6 +1,3 @@
-
-
-
 from __future__ import annotations
 
 import math
@@ -21,7 +18,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-APP_NAME = "Football Edge v8"
+APP_NAME = "Football Edge v8.1 Diagnostic"
 BASE_DIR = Path(__file__).resolve().parent
 
 THESPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json/123"
@@ -71,7 +68,7 @@ UA = (
 CACHE: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 600
 
-app = FastAPI(title=APP_NAME, version="8.0")
+app = FastAPI(title=APP_NAME, version="8.1")
 
 
 class AnalyzeRequest(BaseModel):
@@ -1520,14 +1517,25 @@ def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None, hom
     hx = ((hgf + aga) / 2) * 1.08
     ax = ((agf + hga) / 2) * .96
 
+    diagnostic_raw_hx = hx
+    diagnostic_raw_ax = ax
+
     # Recent form still matters, but much less than in the old model.
     ppg_edge = clamp(hs["ppg"] - aas["ppg"], -1.5, 1.5)
     hx *= 1 + ppg_edge * .025
     ax *= 1 - ppg_edge * .020
 
+    diagnostic_form_hx = hx
+    diagnostic_form_ax = ax
+
     # v8 Global Elo Hybrid layer.
     # Long-term/global strength is the anchor; recent form is already blended into
     # home_strength / away_strength and only nudges the prior.
+    elo_diff = 0.0
+    home_advantage_elo = 55.0
+    effective_diff = home_advantage_elo
+    elo_factor = 1.0
+
     if home_strength and away_strength:
         elo_diff = clamp(
             float(home_strength["rating"]) - float(away_strength["rating"]),
@@ -1536,14 +1544,16 @@ def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None, hom
         )
 
         # A modest home advantage. It cannot erase a large global Elo gap.
-        effective_diff = elo_diff + 55.0
+        effective_diff = elo_diff + home_advantage_elo
 
-        # Translate Elo gap into attack-rate adjustment. 200 Elo ≈ meaningful
-        # superiority, while still retaining a realistic upset probability.
-        factor = math.exp((effective_diff / 400.0) * 0.72)
-        factor = clamp(factor, .58, 1.72)
-        hx *= factor
-        ax /= factor
+        # Translate Elo gap into attack-rate adjustment.
+        elo_factor = math.exp((effective_diff / 400.0) * 0.72)
+        elo_factor = clamp(elo_factor, .58, 1.72)
+        hx *= elo_factor
+        ax /= elo_factor
+
+    diagnostic_elo_hx = hx
+    diagnostic_elo_ax = ax
 
     if h2h:
         last = h2h[:5]
@@ -1553,6 +1563,9 @@ def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None, hom
         scale = clamp(blend / cur, .88, 1.12)
         hx *= scale
         ax *= scale
+
+    diagnostic_preclamp_hx = hx
+    diagnostic_preclamp_ax = ax
 
     hx = clamp(hx, .25, 3.8)
     ax = clamp(ax, .20, 3.5)
@@ -1649,6 +1662,50 @@ def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None, hom
                 if home_strength and away_strength else 0.0,
                 1
             ),
+        },
+        "diagnostic": {
+            "raw_xg": {
+                "home": round(diagnostic_raw_hx, 3),
+                "away": round(diagnostic_raw_ax, 3),
+            },
+            "after_recent_form_xg": {
+                "home": round(diagnostic_form_hx, 3),
+                "away": round(diagnostic_form_ax, 3),
+            },
+            "elo": {
+                "home_global_elo": home_strength.get("global_elo") if home_strength else None,
+                "away_global_elo": away_strength.get("global_elo") if away_strength else None,
+                "home_form_elo": home_strength.get("form_elo") if home_strength else None,
+                "away_form_elo": away_strength.get("form_elo") if away_strength else None,
+                "home_hybrid": home_strength.get("rating") if home_strength else None,
+                "away_hybrid": away_strength.get("rating") if away_strength else None,
+                "home_source": home_strength.get("source") if home_strength else None,
+                "away_source": away_strength.get("source") if away_strength else None,
+                "home_external": home_strength.get("external") if home_strength else False,
+                "away_external": away_strength.get("external") if away_strength else False,
+                "rating_difference": round(elo_diff, 1),
+                "home_advantage": round(home_advantage_elo, 1),
+                "effective_difference": round(effective_diff, 1),
+                "xg_factor": round(elo_factor, 4),
+            },
+            "after_elo_xg": {
+                "home": round(diagnostic_elo_hx, 3),
+                "away": round(diagnostic_elo_ax, 3),
+            },
+            "before_final_clamp_xg": {
+                "home": round(diagnostic_preclamp_hx, 3),
+                "away": round(diagnostic_preclamp_ax, 3),
+            },
+            "final_xg": {
+                "home": round(hx, 3),
+                "away": round(ax, 3),
+            },
+            "recent_form": {
+                "home_ppg": hs.get("ppg"),
+                "away_ppg": aas.get("ppg"),
+                "ppg_edge": round(ppg_edge, 3),
+            },
+            "h2h_matches_used": min(len(h2h), 5),
         },
     }
 
@@ -1878,6 +1935,27 @@ def team_search(q: str = Query(..., min_length=2), limit: int = Query(6, ge=1, l
     }
 
 
+@app.post("/api/diagnose")
+def diagnose(req: AnalyzeRequest):
+    """Return the normal analysis plus a compact model diagnostic view."""
+    result = analyze(req)
+    p = result.get("prediction") or {}
+    return {
+        "teams": result.get("teams"),
+        "recent": {
+            "home_count": len((result.get("recent") or {}).get("home") or []),
+            "away_count": len((result.get("recent") or {}).get("away") or []),
+        },
+        "outcomes": p.get("outcomes"),
+        "expected_goals": p.get("expected_goals"),
+        "power": p.get("power"),
+        "strength": p.get("strength"),
+        "diagnostic": p.get("diagnostic"),
+        "providers": result.get("diagnostics"),
+        "meta": result.get("meta"),
+    }
+
+
 @app.get("/")
 def index():
     return FileResponse(BASE_DIR / "static" / "index.html")
@@ -1888,7 +1966,7 @@ def health():
     return {
         "ok": True,
         "app": APP_NAME,
-        "version": "8.0",
+        "version": "8.1",
         "providers": {
             "football-data": bool(FOOTBALL_DATA_API_KEY),
             "espn": True,
@@ -2022,6 +2100,6 @@ def analyze(req: AnalyzeRequest):
             "source_home": home.provider,
             "source_away": away.provider,
             "football_data_enabled": bool(FOOTBALL_DATA_API_KEY),
-            "note": ("v8 anchors predictions to dynamic Global Elo (national teams / clubs), then blends opponent-adjusted recent form before Dixon-Coles Poisson."),
+            "note": ("v8.1 Diagnostic exposes Global Elo source, hybrid strength, home advantage, xG transformation stages, and final Dixon-Coles probabilities."),
         },
     }
