@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Football Edge v5.1</title>
+<title>Football Edge v5.1.1</title>
 <style>
 :root{--bg:#07111d;--panel:#0d1c2b;--line:#20384f;--text:#f4f8fc;--muted:#91a8bd;--green:#31db8b;--blue:#63a8ff;--amber:#ffc45e}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,#15304b 0,#07111d 38%);color:var(--text);font-family:Inter,"Noto Sans TC","Segoe UI",sans-serif}
@@ -29,7 +29,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;border-bottom:1
 </head>
 <body>
 <main class="wrap">
-<div class="top"><div class="brand">Football <span>Edge v5</span></div><div class="badge">MULTI-SOURCE ENGINE</div></div>
+<div class="top"><div class="brand">Football <span>Edge v5</span></div><div class="badge">MULTI-SOURCE ENGINE v5.1.1</div></div>
 <h1>輸入兩隊，直接做完整賽前分析。</h1>
 <div class="sub">支援俱樂部與國家隊。伺服器會自動搜尋球隊、抓近期賽果與歷史交手，再用主客場權重與 Dixon–Coles Poisson 模型計算勝平負與最可能比分。</div>
 
@@ -75,7 +75,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;border-bottom:1
   <section class="section"><div id="summary" class="callout"></div><div class="callout warn">模型是統計估計，不代表確定比分。先發、傷停、紅牌、賽程與戰術變化都可能改變結果。</div></section>
 </div>
 
-<div class="footer">Football Edge v5.1 · FotMob public web JSON adapter · non-official data source</div>
+<div class="footer">Football Edge v5.1.1 · FotMob public web JSON adapter · non-official data source</div>
 </main>
 
 <script>
@@ -94,7 +94,13 @@ async function analyze(){
   try{
     const r=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({home_team:home,away_team:away,recent_matches:recent})});
     const d=await r.json();
-    if(!r.ok)throw new Error(d.detail||"分析失敗");
+    if(!r.ok){
+      let detail=d.detail;
+      if(detail && typeof detail==="object"){
+        detail=detail.message || JSON.stringify(detail);
+      }
+      throw new Error(detail || "分析失敗");
+    }
     render(d);status("");
   }catch(e){status(e.message||"分析失敗。","err")}
   finally{$("analyze").disabled=false}
