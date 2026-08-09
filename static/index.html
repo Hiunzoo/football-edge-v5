@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Football Edge v10.1</title>
+<title>Football Edge v10.2</title>
 <style>
 :root{--bg:#07111d;--panel:#0d1c2b;--line:#20384f;--text:#f4f8fc;--muted:#91a8bd;--green:#31db8b;--blue:#63a8ff;--amber:#ffc45e}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,#15304b 0,#07111d 38%);color:var(--text);font-family:Inter,"Noto Sans TC","Segoe UI",sans-serif}
@@ -25,11 +25,245 @@ table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;border-bottom:1
 .top10{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.chip{background:#0b1a28;border:1px solid var(--line);border-radius:11px;padding:10px;text-align:center}.chip small{display:block;color:var(--muted)}
 .footer{text-align:center;color:var(--muted);font-size:11px;margin:34px 0}
 @media(max-width:900px){.search,.three,.four,.two{grid-template-columns:1fr}.vs{display:none}.top10{grid-template-columns:repeat(2,1fr)}}
+
+/* ===== v10.2 Dashboard Layout ===== */
+:root{
+  --dash-gap:14px;
+}
+body{
+  background:
+    radial-gradient(circle at 12% 10%, rgba(39,91,137,.28), transparent 34%),
+    linear-gradient(180deg,#071522 0%,#06111d 100%);
+}
+.wrap{
+  max-width:1440px;
+  margin:auto;
+  padding:18px 20px 24px;
+}
+.top{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:14px;
+  margin-bottom:10px;
+}
+.brand{
+  font-size:24px;
+  font-weight:900;
+  letter-spacing:-.3px;
+}
+.badge{
+  white-space:nowrap;
+}
+h1{
+  font-size:clamp(34px,4.3vw,64px);
+  line-height:1.03;
+  margin:12px 0 8px;
+  letter-spacing:-1px;
+}
+.sub{
+  max-width:900px;
+  font-size:14px;
+}
+.search{
+  margin-top:18px;
+  padding:12px;
+  border-radius:15px;
+}
+.search input,.search select,.search button{
+  min-height:48px;
+}
+.section{
+  margin-top:14px;
+}
+.dashboard-hero{
+  display:grid;
+  grid-template-columns:minmax(0,2.15fr) minmax(360px,.95fr);
+  gap:var(--dash-gap);
+  align-items:stretch;
+}
+.hero-left{
+  min-width:0;
+}
+.hero-right{
+  min-width:0;
+}
+.result-card{
+  height:100%;
+  padding:18px;
+  border:1px solid var(--line);
+  border-radius:16px;
+  background:linear-gradient(180deg,rgba(16,42,64,.92),rgba(8,26,42,.94));
+}
+.result-title{
+  font-weight:900;
+  font-size:18px;
+  margin-bottom:18px;
+}
+.result-probs{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:10px;
+  text-align:center;
+}
+.result-probs small{
+  display:block;
+  color:var(--muted);
+  margin-bottom:6px;
+}
+.result-probs .prob{
+  font-size:32px;
+  font-weight:1000;
+}
+.result-probs .home{color:#5aa7ff}
+.result-probs .draw{color:#ffd34e}
+.result-probs .away{color:#42dc8b}
+.prob-bar{
+  display:grid;
+  grid-template-columns:var(--homeProb,33fr) var(--drawProb,34fr) var(--awayProb,33fr);
+  height:11px;
+  overflow:hidden;
+  border-radius:999px;
+  margin-top:16px;
+  background:#183247;
+}
+.prob-bar span:nth-child(1){background:#388cff}
+.prob-bar span:nth-child(2){background:#f0c632}
+.prob-bar span:nth-child(3){background:#31c979}
+.result-reco{
+  margin-top:14px;
+  display:flex;
+  justify-content:space-between;
+  gap:12px;
+  align-items:center;
+  font-size:14px;
+}
+.metrics-row{
+  display:grid;
+  grid-template-columns:repeat(4,1fr);
+  gap:var(--dash-gap);
+  margin-top:14px;
+}
+.metric-card{
+  border:1px solid var(--line);
+  background:linear-gradient(180deg,#102b43,#0b2134);
+  border-radius:14px;
+  padding:16px 18px;
+  min-height:98px;
+}
+.metric-card .label{
+  color:var(--muted);
+  font-size:13px;
+}
+.metric-card .metric-value{
+  font-size:28px;
+  font-weight:1000;
+  margin-top:8px;
+}
+.dashboard-diagnostics{
+  margin-top:14px;
+  border:1px solid var(--line);
+  border-radius:16px;
+  background:rgba(7,24,38,.64);
+  padding:14px;
+}
+.dashboard-diagnostics>.sectionhead{
+  margin-bottom:12px;
+}
+.diagnostic-grid{
+  display:grid;
+  grid-template-columns:1.05fr 1.1fr 1.35fr .85fr;
+  gap:12px;
+}
+.diag-panel{
+  min-width:0;
+  border:1px solid var(--line);
+  border-radius:13px;
+  background:#0a1d2d;
+  overflow:hidden;
+}
+.diag-panel-title{
+  padding:10px 12px;
+  border-bottom:1px solid var(--line);
+  text-align:center;
+  font-weight:800;
+}
+.diag-panel-body{
+  padding:13px;
+}
+.bottom-dashboard{
+  display:grid;
+  grid-template-columns:.9fr 1.3fr .9fr;
+  gap:var(--dash-gap);
+  margin-top:14px;
+  align-items:stretch;
+}
+.bottom-panel{
+  min-width:0;
+  border:1px solid var(--line);
+  border-radius:15px;
+  background:#091d2e;
+  padding:14px;
+}
+.bottom-panel h2{
+  font-size:18px;
+  margin:0 0 12px;
+}
+.top10{
+  grid-template-columns:repeat(5,1fr)!important;
+}
+.mini-info-grid{
+  display:grid;
+  grid-template-columns:repeat(2,1fr);
+  gap:9px;
+}
+.mini-info{
+  border:1px solid var(--line);
+  border-radius:10px;
+  padding:11px;
+  background:#0e2940;
+}
+.risk-box{
+  border:1px solid #4f3434;
+  background:rgba(89,26,31,.19);
+  border-radius:11px;
+  padding:12px;
+  line-height:1.65;
+  font-size:13px;
+}
+.good-box{
+  border:1px solid #235e45;
+  background:rgba(21,86,58,.18);
+  border-radius:11px;
+  padding:12px;
+  margin-bottom:10px;
+}
+.model-diagnostic-old{
+  display:none!important;
+}
+.footer{
+  margin-top:14px;
+  padding-top:12px;
+  border-top:1px solid var(--line);
+}
+@media(max-width:1050px){
+  .dashboard-hero{grid-template-columns:1fr}
+  .metrics-row{grid-template-columns:repeat(2,1fr)}
+  .diagnostic-grid{grid-template-columns:repeat(2,1fr)}
+  .bottom-dashboard{grid-template-columns:1fr}
+}
+@media(max-width:650px){
+  .wrap{padding:12px}
+  .metrics-row,.diagnostic-grid{grid-template-columns:1fr}
+  .top10{grid-template-columns:repeat(2,1fr)!important}
+  .result-probs .prob{font-size:26px}
+}
+
 </style>
 </head>
 <body>
 <main class="wrap">
-<div class="top"><div class="brand">Football <span>Edge v10</span></div><div class="badge">CALIBRATED MODEL v10.1</div></div>
+<div class="top"><div class="brand">Football <span>Edge v10</span></div><div class="badge">BACKTEST & CALIBRATED v10.2</div></div>
 <h1>輸入兩隊，直接做完整賽前分析。</h1>
 <div class="sub">支援俱樂部與國家隊。伺服器會自動搜尋球隊、抓近期賽果與歷史交手，再用主客場權重與 Dixon–Coles Poisson 模型計算勝平負與最可能比分。</div>
 
@@ -40,8 +274,84 @@ table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;border-bottom:1
   <select id="recent"><option value="5">近 5 場</option><option value="10" selected>近 10 場</option><option value="15">近 15 場</option><option value="20">近 20 場</option></select>
   <button id="analyze">開始分析</button>
 </div>
-<div class="hint">輸入常用隊名即可，例如 Liverpool、Man City、PSG；系統會自動比對正式球隊名稱；v10.1 會直接顯示 Global Elo 是否成功取得、Hybrid Rating、主場加成，以及 xG 在各階段的變化，方便檢查模型是否真的使用到長期實力。<br>v8 會自動解析球隊，跨 ESPN、TheSportsDB、FotMob 與可用正式 API 收集多年度賽事，合併去重後取真正最近場次。</div>
+<div class="hint">輸入常用隊名即可，例如 Liverpool、Man City、PSG；系統會自動比對正式球隊名稱；v10.2 會直接顯示 Global Elo 是否成功取得、Hybrid Rating、主場加成，以及 xG 在各階段的變化，方便檢查模型是否真的使用到長期實力。<br>v8 會自動解析球隊，跨 ESPN、TheSportsDB、FotMob 與可用正式 API 收集多年度賽事，合併去重後取真正最近場次。</div>
 <div id="status" class="status"></div>
+<div id="dashboardHero" class="dashboard-hero hidden">
+  <div class="hero-left">
+    <div id="dashboardLegacyMount"></div>
+  </div>
+  <div class="hero-right">
+    <div class="result-card">
+      <div class="result-title">預測結果（1X2・校準後）</div>
+      <div class="result-probs">
+        <div><small>主勝</small><div class="prob home" id="dashHomeProb">--</div></div>
+        <div><small>和局</small><div class="prob draw" id="dashDrawProb">--</div></div>
+        <div><small>客勝</small><div class="prob away" id="dashAwayProb">--</div></div>
+      </div>
+      <div class="prob-bar" id="dashProbBar"><span></span><span></span><span></span></div>
+      <div class="result-reco">
+        <strong id="dashRecommendation">推薦：--</strong>
+        <span id="dashConfidence">信心：--</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="dashMetrics" class="metrics-row hidden">
+  <div class="metric-card"><div class="label">預期進球（xG）</div><div class="metric-value" id="dashXg">--</div></div>
+  <div class="metric-card"><div class="label">實力差（Hybrid Elo）</div><div class="metric-value" id="dashEloDiff">--</div></div>
+  <div class="metric-card"><div class="label">主場優勢</div><div class="metric-value" id="dashHomeAdv">--</div></div>
+  <div class="metric-card"><div class="label">模型信心</div><div class="metric-value" id="dashModelConfidence">--</div></div>
+</div>
+
+<section id="dashDiagnostics" class="dashboard-diagnostics hidden">
+  <div class="sectionhead"><h2>模型診斷（關鍵數據）</h2><small>Global Elo + 近期狀態 + xG 校準流程</small></div>
+  <div class="diagnostic-grid">
+    <div class="diag-panel">
+      <div class="diag-panel-title">長期全球實力（Elo）</div>
+      <div class="diag-panel-body">
+        <div class="mini-info-grid">
+          <div class="mini-info"><small>主隊 Elo</small><div class="big" id="dashGlobalHome">--</div></div>
+          <div class="mini-info"><small>客隊 Elo</small><div class="big" id="dashGlobalAway">--</div></div>
+          <div class="mini-info"><small>主隊來源</small><div id="dashGlobalHomeSrc">--</div></div>
+          <div class="mini-info"><small>客隊來源</small><div id="dashGlobalAwaySrc">--</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="diag-panel">
+      <div class="diag-panel-title">Hybrid Rating</div>
+      <div class="diag-panel-body">
+        <div class="mini-info-grid">
+          <div class="mini-info"><small>主隊 Hybrid</small><div class="big" id="dashHybridHome">--</div></div>
+          <div class="mini-info"><small>客隊 Hybrid</small><div class="big" id="dashHybridAway">--</div></div>
+        </div>
+        <div class="mini-info" style="margin-top:9px"><small>實力差（主－客）</small><div class="big" id="dashHybridDiff">--</div></div>
+      </div>
+    </div>
+    <div class="diag-panel">
+      <div class="diag-panel-title">xG 演算過程</div>
+      <div class="diag-panel-body">
+        <div class="mini-info-grid">
+          <div class="mini-info"><small>原始 xG</small><div id="dashRawXg">--</div></div>
+          <div class="mini-info"><small>近期狀態後</small><div id="dashFormXg">--</div></div>
+          <div class="mini-info"><small>Elo 校正後</small><div id="dashEloXg">--</div></div>
+          <div class="mini-info"><small>最終 xG</small><div id="dashFinalXg">--</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="diag-panel">
+      <div class="diag-panel-title">校準與品質</div>
+      <div class="diag-panel-body">
+        <div class="mini-info-grid" style="grid-template-columns:1fr">
+          <div class="mini-info"><small>Poisson 權重</small><div class="big" id="dashPoissonWeight">--</div></div>
+          <div class="mini-info"><small>Global Elo 權重</small><div class="big" id="dashEloWeight">--</div></div>
+          <div class="mini-info"><small>資料品質</small><div class="big" id="dashDataQuality">--</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
 
 <div id="results" class="hidden">
   <section class="section grid three">
@@ -109,7 +419,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;border-bottom:1
   <section class="section"><div id="summary" class="callout"></div><div class="callout warn">模型是統計估計，不代表確定比分。先發、傷停、紅牌、賽程與戰術變化都可能改變結果。</div></section>
 </div>
 
-<div class="footer">Football Edge v10.1 · FotMob public web JSON adapter · non-official data source</div>
+<div class="footer">Football Edge v10.2 · FotMob public web JSON adapter · non-official data source</div>
 </main>
 
 <script>
@@ -180,6 +490,7 @@ async function analyze(){
 }
 
 function render(d){
+  updateDashboardLayout(d);
   const h=d.teams.home,a=d.teams.away,p=d.prediction,hs=d.stats.home,as=d.stats.away;
   $("homeName").textContent=h.name;$("awayName").textContent=a.name;
   $("homeForm").innerHTML=formHtml(hs.form);$("awayForm").innerHTML=formHtml(as.form);
@@ -235,6 +546,64 @@ function render(d){
 }
 $("analyze").addEventListener("click",analyze);
 ["home","away"].forEach(id=>$(id).addEventListener("keydown",e=>{if(e.key==="Enter")analyze()}));
+
+function updateDashboardLayout(d){
+  const p=d?.prediction||{};
+  const o=p.outcomes||{};
+  const dg=p.diagnostic||{};
+  const st=p.strength||{};
+  const cal=p.calibration||dg.calibration||{};
+
+  const pctv=v=>v==null?"--":`${Number(v).toFixed(1)}%`;
+  const h=Number(o.home||0), dr=Number(o.draw||0), a=Number(o.away||0);
+
+  if($("dashboardHero")) $("dashboardHero").classList.remove("hidden");
+  if($("dashMetrics")) $("dashMetrics").classList.remove("hidden");
+  if($("dashDiagnostics")) $("dashDiagnostics").classList.remove("hidden");
+
+  if($("dashHomeProb")) $("dashHomeProb").textContent=pctv(h);
+  if($("dashDrawProb")) $("dashDrawProb").textContent=pctv(dr);
+  if($("dashAwayProb")) $("dashAwayProb").textContent=pctv(a);
+
+  const bar=$("dashProbBar");
+  if(bar){
+    bar.style.setProperty("--homeProb",`${Math.max(h,.1)}fr`);
+    bar.style.setProperty("--drawProb",`${Math.max(dr,.1)}fr`);
+    bar.style.setProperty("--awayProb",`${Math.max(a,.1)}fr`);
+  }
+
+  const max=Math.max(h,dr,a);
+  const label=max===h?`推薦：${d?.teams?.home?.name||"主隊"} 主勝`:
+              max===a?`推薦：${d?.teams?.away?.name||"客隊"} 客勝`:"推薦：和局";
+  if($("dashRecommendation")) $("dashRecommendation").textContent=label;
+  if($("dashConfidence")) $("dashConfidence").textContent=`信心：${p.confidence ?? "--"}/100`;
+
+  if($("dashXg")){
+    const x=p.expected_goals||{};
+    $("dashXg").textContent=`${x.home ?? "--"} / ${x.away ?? "--"}`;
+  }
+  if($("dashEloDiff")) $("dashEloDiff").textContent=(st.difference>0?"+":"")+(st.difference ?? "--");
+  if($("dashHomeAdv")) $("dashHomeAdv").textContent=dg?.elo?.home_advantage!=null?`+${dg.elo.home_advantage}`:"--";
+  if($("dashModelConfidence")) $("dashModelConfidence").textContent=`${p.confidence ?? "--"}/100`;
+
+  if($("dashGlobalHome")) $("dashGlobalHome").textContent=dg?.elo?.home_global_elo ?? "--";
+  if($("dashGlobalAway")) $("dashGlobalAway").textContent=dg?.elo?.away_global_elo ?? "--";
+  if($("dashGlobalHomeSrc")) $("dashGlobalHomeSrc").textContent=dg?.elo?.home_source || "--";
+  if($("dashGlobalAwaySrc")) $("dashGlobalAwaySrc").textContent=dg?.elo?.away_source || "--";
+  if($("dashHybridHome")) $("dashHybridHome").textContent=dg?.elo?.home_hybrid ?? st?.home?.rating ?? "--";
+  if($("dashHybridAway")) $("dashHybridAway").textContent=dg?.elo?.away_hybrid ?? st?.away?.rating ?? "--";
+  if($("dashHybridDiff")) $("dashHybridDiff").textContent=(st.difference>0?"+":"")+(st.difference ?? "--");
+
+  if($("dashRawXg")) $("dashRawXg").textContent=`${dg?.raw_xg?.home ?? "--"} / ${dg?.raw_xg?.away ?? "--"}`;
+  if($("dashFormXg")) $("dashFormXg").textContent=`${dg?.after_recent_form_xg?.home ?? "--"} / ${dg?.after_recent_form_xg?.away ?? "--"}`;
+  if($("dashEloXg")) $("dashEloXg").textContent=`${dg?.after_elo_xg?.home ?? "--"} / ${dg?.after_elo_xg?.away ?? "--"}`;
+  if($("dashFinalXg")) $("dashFinalXg").textContent=`${dg?.final_xg?.home ?? "--"} / ${dg?.final_xg?.away ?? "--"}`;
+
+  if($("dashPoissonWeight")) $("dashPoissonWeight").textContent=cal?.poisson_weight!=null?`${Math.round(cal.poisson_weight*100)}%`:"--";
+  if($("dashEloWeight")) $("dashEloWeight").textContent=cal?.elo_weight!=null?`${Math.round(cal.elo_weight*100)}%`:"--";
+  if($("dashDataQuality")) $("dashDataQuality").textContent=cal?.data_quality!=null?`${Math.round(cal.data_quality*100)}%`:"--";
+}
+
 </script>
 </body>
 </html>
