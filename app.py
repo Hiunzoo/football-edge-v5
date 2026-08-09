@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-APP_NAME = "Football Edge v10 Calibrated Strength"
+APP_NAME = "Football Edge v10.1 Calibrated Strength"
 BASE_DIR = Path(__file__).resolve().parent
 
 THESPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json/123"
@@ -68,7 +68,7 @@ UA = (
 CACHE: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 600
 
-app = FastAPI(title=APP_NAME, version="10.0")
+app = FastAPI(title=APP_NAME, version="10.1")
 
 
 class AnalyzeRequest(BaseModel):
@@ -1724,7 +1724,7 @@ def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None, hom
     hp, dp, ap, over, btts = [x / mass for x in (hp, dp, ap, over, btts)]
     cells.sort(reverse=True)
 
-    sample_quality = data_quality_score(
+    quality_score = data_quality_score(
         hs.get("played", 0),
         aas.get("played", 0),
         home_strength,
@@ -1734,7 +1734,7 @@ def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None, hom
         {"home": hp, "draw": dp, "away": ap},
         home_strength,
         away_strength,
-        sample_quality,
+        quality_score,
     )
     hp_cal = calibrated["home"]
     dp_cal = calibrated["draw"]
@@ -1750,13 +1750,13 @@ def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None, hom
     min_side_sample = min(hs["played"], aas["played"])
 
     if min_side_sample >= 8:
-        sample_quality = "normal"
+        sample_quality_label = "normal"
         sample_penalty = 0
     elif min_side_sample >= 5:
-        sample_quality = "medium"
+        sample_quality_label = "medium"
         sample_penalty = 8
     else:
-        sample_quality = "low"
+        sample_quality_label = "low"
         sample_penalty = 18
 
     conf = int(clamp(
@@ -1765,6 +1765,13 @@ def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None, hom
         90
     ))
 
+    quality_cap = int(55 + 35 * quality_score)
+    conf = min(conf, quality_cap)
+    if not (home_strength and home_strength.get("verified")):
+        conf = min(conf, 65)
+    if not (away_strength and away_strength.get("verified")):
+        conf = min(conf, 65)
+
     return {
         "expected_goals": {
             "home": round(hx, 2),
@@ -1772,11 +1779,22 @@ def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None, hom
             "total": round(hx + ax, 2),
         },
         "outcomes": {
+            "home": round(hp_cal * 100, 1),
+            "draw": round(dp_cal * 100, 1),
+            "away": round(ap_cal * 100, 1),
+            "home_or_draw": round((hp_cal + dp_cal) * 100, 1),
+            "away_or_draw": round((ap_cal + dp_cal) * 100, 1),
+        },
+        "raw_poisson_outcomes": {
             "home": round(hp * 100, 1),
             "draw": round(dp * 100, 1),
             "away": round(ap * 100, 1),
-            "home_or_draw": round((hp + dp) * 100, 1),
-            "away_or_draw": round((ap + dp) * 100, 1),
+        },
+        "calibration": {
+            "poisson_weight": round(calibrated["poisson_weight"], 3),
+            "elo_weight": round(calibrated["elo_weight"], 3),
+            "elo_prior": calibrated["elo_prior"],
+            "data_quality": round(quality_score, 3),
         },
         "markets": {
             "over_2_5": round(over * 100, 1),
@@ -1787,7 +1805,7 @@ def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None, hom
         "top_scores": top10[:3],
         "top_scores_10": top10,
         "confidence": conf,
-        "sample_quality": sample_quality,
+        "sample_quality": sample_quality_label,
         "sample_counts": {
             "home": hs["played"],
             "away": aas["played"],
@@ -1865,7 +1883,7 @@ def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None, hom
                 "elo_prior": calibrated["elo_prior"],
                 "poisson_weight": round(calibrated["poisson_weight"], 3),
                 "elo_weight": round(calibrated["elo_weight"], 3),
-                "data_quality": round(sample_quality, 3),
+                "data_quality": round(quality_score, 3),
                 "final": {
                     "home": round(hp_cal, 4),
                     "draw": round(dp_cal, 4),
@@ -2132,7 +2150,7 @@ def health():
     return {
         "ok": True,
         "app": APP_NAME,
-        "version": "10.0",
+        "version": "10.1",
         "providers": {
             "football-data": bool(FOOTBALL_DATA_API_KEY),
             "espn": True,
@@ -2266,6 +2284,6 @@ def analyze(req: AnalyzeRequest):
             "source_home": home.provider,
             "source_away": away.provider,
             "football_data_enabled": bool(FOOTBALL_DATA_API_KEY),
-            "note": ("v10 calibrates Dixon-Coles/Poisson 1X2 probabilities against verified Global Elo, adapts weighting to sample quality, and lowers confidence when long-term strength or match data are weak."),
+            "note": ("v10.1 fixes calibration output and quality typing; displayed 1X2 probabilities now use the calibrated Global Elo + Dixon-Coles blend."),
         },
     }
