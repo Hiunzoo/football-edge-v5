@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-APP_NAME = "Football Edge v8.1 Diagnostic"
+APP_NAME = "Football Edge v9 Global Strength"
 BASE_DIR = Path(__file__).resolve().parent
 
 THESPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json/123"
@@ -68,7 +68,7 @@ UA = (
 CACHE: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 600
 
-app = FastAPI(title=APP_NAME, version="8.1")
+app = FastAPI(title=APP_NAME, version="9.0")
 
 
 class AnalyzeRequest(BaseModel):
@@ -1227,54 +1227,80 @@ def clubelo_rating(team_name: str):
     return None
 
 
-def national_elo_rating(team_name: str):
-    """Read current national-team Elo from footballratings.org.
+def _footballratings_slug(name: str) -> str:
+    s = norm(name)
+    # common punctuation/name normalization for footballratings.org team slugs
+    s = s.replace("&", " and ")
+    s = re.sub(r"\bunited states of america\b", "united states", s)
+    s = re.sub(r"\busa\b", "united states", s)
+    s = re.sub(r"\bsouth korea\b", "south korea", s)
+    s = re.sub(r"\bczech republic\b", "czechia", s)
+    s = re.sub(r"\s+", "-", s.strip())
+    return re.sub(r"[^a-z0-9-]", "", s)
 
-    The page mirrors World Football Elo Ratings and is updated regularly.
-    We parse the visible ranking text conservatively and fall back if unavailable.
+
+def national_elo_rating(team_name: str):
+    """Fetch a national team's current Elo from its team-specific page.
+
+    This is deliberately different from v8: the homepage only renders a slice
+    of the ranking server-side, so searching the homepage could silently miss
+    teams. The team page exposes "Current Rating" directly.
     """
-    key = f"nationalelo:{norm(team_name)}"
+    slug = _footballratings_slug(team_name)
+    if not slug:
+        return None
+
+    key = f"nationalelo:v9:{slug}"
     cached = _cached_external(key)
     if cached is not None:
         return cached
 
+    url = f"https://www.footballratings.org/team/{slug}"
     try:
         r = requests.get(
-            "https://www.footballratings.org/",
+            url,
             timeout=12,
-            headers={"User-Agent": UA, "Accept": "text/html,*/*"},
+            headers={
+                "User-Agent": UA,
+                "Accept": "text/html,application/xhtml+xml,*/*",
+            },
         )
         if r.status_code != 200:
             _cache_external(key, None)
             return None
 
-        # Strip markup, then search around an exact-ish team name for "Rating N".
         raw = re.sub(r"<script.*?</script>|<style.*?</style>", " ", r.text, flags=re.I | re.S)
         raw = re.sub(r"<[^>]+>", " ", raw)
         raw = html.unescape(raw)
         raw = re.sub(r"\s+", " ", raw)
 
-        escaped = re.escape(team_name.strip())
+        # Team pages contain: "Current Rating 1,888 29 Jul 2026"
         patterns = [
-            rf"\b{escaped}\b\s+Rating\s*([12]\d{{3}})",
-            rf"\b{escaped}\b.*?\bRating\s*([12]\d{{3}})",
+            r"Current\s+Rating\s+([0-9]{1,2}(?:,[0-9]{3})?)",
+            r"Current\s+Rating.*?([12][0-9]{3})",
         ]
         elo = None
         for pat in patterns:
             m = re.search(pat, raw, flags=re.I)
             if m:
-                elo = float(m.group(1))
+                elo = float(m.group(1).replace(",", ""))
                 break
 
-        if elo is None:
+        if elo is None or not (400 <= elo <= 2600):
             _cache_external(key, None)
             return None
+
+        rank = None
+        rm = re.search(r"Current\s+Rank\s+#?([0-9]{1,3})", raw, flags=re.I)
+        if rm:
+            rank = rm.group(1)
 
         value = {
             "elo": round(elo, 1),
             "source": "World Football Elo",
             "club": team_name,
-            "rank": None,
+            "rank": rank,
+            "url": url,
         }
         _cache_external(key, value)
         return value
@@ -1284,16 +1310,19 @@ def national_elo_rating(team_name: str):
 
 
 def external_global_rating(team_name: str):
-    """Resolve a global long-term prior without hard-coded team strengths.
+    """Resolve a long-term strength prior without hard-coded ratings.
 
-    National Elo is attempted first; if not found, ClubElo is attempted.
+    National-team Elo is authoritative when its team page exists.
+    ClubElo is then tried for club teams.
     """
     nat = national_elo_rating(team_name)
     if nat:
         return nat
+
     club = clubelo_rating(team_name)
     if club:
         return club
+
     return None
 
 
@@ -1305,29 +1334,37 @@ def synthetic_elo_from_power(power: dict | None):
 
 
 def hybrid_strength(global_rating, internal_power):
-    """Blend global long-term Elo with opponent-adjusted current form.
+    """Build the strength used by the model.
 
-    External Elo is the anchor. Internal power only nudges it.
+    If a genuine external rating exists it is the foundation. Recent form is a
+    small adjustment only. If external strength is unavailable, we keep the
+    fallback explicitly marked as unverified and reduce its influence later.
     """
-    fallback = synthetic_elo_from_power(internal_power)
+    form_elo = synthetic_elo_from_power(internal_power)
+
     if global_rating and global_rating.get("elo") is not None:
         global_elo = float(global_rating["elo"])
-        # 78% long-term/global, 22% current opponent-adjusted form.
-        rating = 0.78 * global_elo + 0.22 * fallback
+
+        # v9: 90% long-term global strength, 10% recent opponent-adjusted form.
+        rating = 0.90 * global_elo + 0.10 * form_elo
         return {
             "rating": round(rating, 1),
             "global_elo": round(global_elo, 1),
-            "form_elo": round(fallback, 1),
+            "form_elo": round(form_elo, 1),
             "source": global_rating.get("source") or "External Elo",
             "external": True,
+            "verified": True,
+            "rank": global_rating.get("rank"),
         }
 
     return {
-        "rating": round(fallback, 1),
+        "rating": round(form_elo, 1),
         "global_elo": None,
-        "form_elo": round(fallback, 1),
-        "source": "Internal opponent-adjusted fallback",
+        "form_elo": round(form_elo, 1),
+        "source": "Unverified internal fallback",
         "external": False,
+        "verified": False,
+        "rank": None,
     }
 
 
@@ -1535,22 +1572,41 @@ def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None, hom
     home_advantage_elo = 55.0
     effective_diff = home_advantage_elo
     elo_factor = 1.0
+    strength_anchor_weight = 0.0
 
     if home_strength and away_strength:
         elo_diff = clamp(
             float(home_strength["rating"]) - float(away_strength["rating"]),
-            -500.0,
-            500.0,
+            -650.0,
+            650.0,
         )
-
-        # A modest home advantage. It cannot erase a large global Elo gap.
         effective_diff = elo_diff + home_advantage_elo
 
-        # Translate Elo gap into attack-rate adjustment.
-        elo_factor = math.exp((effective_diff / 400.0) * 0.72)
-        elo_factor = clamp(elo_factor, .58, 1.72)
-        hx *= elo_factor
-        ax /= elo_factor
+        # Preserve the form-derived expected total goals, but let long-term
+        # strength determine most of how those goals are distributed.
+        total_xg = clamp(hx + ax, 1.20, 5.80)
+        form_ratio = clamp(hx / max(ax, .05), .15, 6.5)
+
+        # 300 Elo points roughly represents a very large strength gap.
+        strength_ratio = math.exp(effective_diff / 300.0)
+        strength_ratio = clamp(strength_ratio, .16, 6.25)
+
+        both_verified = bool(
+            home_strength.get("verified") and away_strength.get("verified")
+        )
+        strength_anchor_weight = .72 if both_verified else .30
+
+        blended_log_ratio = (
+            (1.0 - strength_anchor_weight) * math.log(form_ratio)
+            + strength_anchor_weight * math.log(strength_ratio)
+        )
+        blended_ratio = math.exp(blended_log_ratio)
+
+        hx = total_xg * blended_ratio / (1.0 + blended_ratio)
+        ax = total_xg / (1.0 + blended_ratio)
+
+        # Keep a diagnostic multiplier for readability only.
+        elo_factor = blended_ratio / form_ratio
 
     diagnostic_elo_hx = hx
     diagnostic_elo_ax = ax
@@ -1687,6 +1743,9 @@ def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None, hom
                 "home_advantage": round(home_advantage_elo, 1),
                 "effective_difference": round(effective_diff, 1),
                 "xg_factor": round(elo_factor, 4),
+                "strength_anchor_weight": round(strength_anchor_weight, 2),
+                "home_verified": bool(home_strength.get("verified")) if home_strength else False,
+                "away_verified": bool(away_strength.get("verified")) if away_strength else False,
             },
             "after_elo_xg": {
                 "home": round(diagnostic_elo_hx, 3),
@@ -1966,7 +2025,7 @@ def health():
     return {
         "ok": True,
         "app": APP_NAME,
-        "version": "8.1",
+        "version": "9.0",
         "providers": {
             "football-data": bool(FOOTBALL_DATA_API_KEY),
             "espn": True,
@@ -2100,6 +2159,6 @@ def analyze(req: AnalyzeRequest):
             "source_home": home.provider,
             "source_away": away.provider,
             "football_data_enabled": bool(FOOTBALL_DATA_API_KEY),
-            "note": ("v8.1 Diagnostic exposes Global Elo source, hybrid strength, home advantage, xG transformation stages, and final Dixon-Coles probabilities."),
+            "note": ("v9 uses team-specific World Football Elo pages for national teams, ClubElo for clubs, and makes verified global strength the primary xG allocation anchor."),
         },
     }
