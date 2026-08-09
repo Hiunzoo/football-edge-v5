@@ -1,6 +1,12 @@
+
+
+
 from __future__ import annotations
 
 import math
+import csv
+import io
+import html
 import os
 import re
 import time
@@ -15,7 +21,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-APP_NAME = "Football Edge v7"
+APP_NAME = "Football Edge v8"
 BASE_DIR = Path(__file__).resolve().parent
 
 THESPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json/123"
@@ -65,7 +71,7 @@ UA = (
 CACHE: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 600
 
-app = FastAPI(title=APP_NAME, version="7.0")
+app = FastAPI(title=APP_NAME, version="8.0")
 
 
 class AnalyzeRequest(BaseModel):
@@ -1150,6 +1156,184 @@ def team_stats(events, team, venue=None):
     }
 
 
+
+GLOBAL_ELO_CACHE_TTL = 21600  # 6 hours
+
+
+def _cached_external(key: str):
+    item = CACHE.get(key)
+    if not item:
+        return None
+    ts, value = item
+    if time.time() - ts > GLOBAL_ELO_CACHE_TTL:
+        CACHE.pop(key, None)
+        return None
+    return value
+
+
+def _cache_external(key: str, value: Any):
+    CACHE[key] = (time.time(), value)
+
+
+def _clubelo_slug(name: str) -> str:
+    s = norm(name)
+    # ClubElo commonly uses compact slugs: RealMadrid, ManCity, Liverpool...
+    for suffix in (" fc", " afc", " cf", " sc"):
+        if s.endswith(suffix):
+            s = s[:-len(suffix)].strip()
+    return re.sub(r"[^a-z0-9]", "", s)
+
+
+def clubelo_rating(team_name: str):
+    """Try ClubElo public CSV history for club teams."""
+    slug = _clubelo_slug(team_name)
+    if not slug:
+        return None
+
+    key = f"clubelo:{slug}"
+    cached = _cached_external(key)
+    if cached is not None:
+        return cached
+
+    urls = [
+        f"https://api.clubelo.com/{slug}",
+        f"http://api.clubelo.com/{slug}",
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=10, headers={"User-Agent": UA})
+            if r.status_code != 200 or "Elo" not in r.text[:500]:
+                continue
+            rows = list(csv.DictReader(io.StringIO(r.text)))
+            good = []
+            for row in rows:
+                try:
+                    elo = float(row.get("Elo") or "")
+                except (TypeError, ValueError):
+                    continue
+                good.append((row, elo))
+            if not good:
+                continue
+            row, elo = good[-1]
+            value = {
+                "elo": round(elo, 1),
+                "source": "ClubElo",
+                "club": row.get("Club") or team_name,
+                "rank": row.get("Rank"),
+            }
+            _cache_external(key, value)
+            return value
+        except Exception:
+            continue
+
+    _cache_external(key, None)
+    return None
+
+
+def national_elo_rating(team_name: str):
+    """Read current national-team Elo from footballratings.org.
+
+    The page mirrors World Football Elo Ratings and is updated regularly.
+    We parse the visible ranking text conservatively and fall back if unavailable.
+    """
+    key = f"nationalelo:{norm(team_name)}"
+    cached = _cached_external(key)
+    if cached is not None:
+        return cached
+
+    try:
+        r = requests.get(
+            "https://www.footballratings.org/",
+            timeout=12,
+            headers={"User-Agent": UA, "Accept": "text/html,*/*"},
+        )
+        if r.status_code != 200:
+            _cache_external(key, None)
+            return None
+
+        # Strip markup, then search around an exact-ish team name for "Rating N".
+        raw = re.sub(r"<script.*?</script>|<style.*?</style>", " ", r.text, flags=re.I | re.S)
+        raw = re.sub(r"<[^>]+>", " ", raw)
+        raw = html.unescape(raw)
+        raw = re.sub(r"\s+", " ", raw)
+
+        escaped = re.escape(team_name.strip())
+        patterns = [
+            rf"\b{escaped}\b\s+Rating\s*([12]\d{{3}})",
+            rf"\b{escaped}\b.*?\bRating\s*([12]\d{{3}})",
+        ]
+        elo = None
+        for pat in patterns:
+            m = re.search(pat, raw, flags=re.I)
+            if m:
+                elo = float(m.group(1))
+                break
+
+        if elo is None:
+            _cache_external(key, None)
+            return None
+
+        value = {
+            "elo": round(elo, 1),
+            "source": "World Football Elo",
+            "club": team_name,
+            "rank": None,
+        }
+        _cache_external(key, value)
+        return value
+    except Exception:
+        _cache_external(key, None)
+        return None
+
+
+def external_global_rating(team_name: str):
+    """Resolve a global long-term prior without hard-coded team strengths.
+
+    National Elo is attempted first; if not found, ClubElo is attempted.
+    """
+    nat = national_elo_rating(team_name)
+    if nat:
+        return nat
+    club = clubelo_rating(team_name)
+    if club:
+        return club
+    return None
+
+
+def synthetic_elo_from_power(power: dict | None):
+    """Convert internal 0-100 power into an Elo-like fallback scale."""
+    if not power:
+        return 1500.0
+    return 1500.0 + (float(power.get("rating", 50.0)) - 50.0) * 10.0
+
+
+def hybrid_strength(global_rating, internal_power):
+    """Blend global long-term Elo with opponent-adjusted current form.
+
+    External Elo is the anchor. Internal power only nudges it.
+    """
+    fallback = synthetic_elo_from_power(internal_power)
+    if global_rating and global_rating.get("elo") is not None:
+        global_elo = float(global_rating["elo"])
+        # 78% long-term/global, 22% current opponent-adjusted form.
+        rating = 0.78 * global_elo + 0.22 * fallback
+        return {
+            "rating": round(rating, 1),
+            "global_elo": round(global_elo, 1),
+            "form_elo": round(fallback, 1),
+            "source": global_rating.get("source") or "External Elo",
+            "external": True,
+        }
+
+    return {
+        "rating": round(fallback, 1),
+        "global_elo": None,
+        "form_elo": round(fallback, 1),
+        "source": "Internal opponent-adjusted fallback",
+        "external": False,
+    }
+
+
 def weighted_team_form(events, team):
     """Recency-weighted form used by the power layer.
 
@@ -1322,7 +1506,7 @@ def dc_tau(h, a, hx, ax, rho=-0.08):
     return 1.0
 
 
-def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None):
+def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None, home_strength=None, away_strength=None):
     hgf = hv["gf_avg"] if hv["played"] >= 2 else hs["gf_avg"]
     hga = hv["ga_avg"] if hv["played"] >= 2 else hs["ga_avg"]
     agf = av["gf_avg"] if av["played"] >= 2 else aas["gf_avg"]
@@ -1341,16 +1525,23 @@ def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None):
     hx *= 1 + ppg_edge * .025
     ax *= 1 - ppg_edge * .020
 
-    # Power layer: long-ish form + opponent strength.
-    # A large rating gap should materially move xG, without making upsets impossible.
-    if home_power and away_power:
-        power_diff = clamp(
-            float(home_power["rating"]) - float(away_power["rating"]),
-            -35.0,
-            35.0,
+    # v8 Global Elo Hybrid layer.
+    # Long-term/global strength is the anchor; recent form is already blended into
+    # home_strength / away_strength and only nudges the prior.
+    if home_strength and away_strength:
+        elo_diff = clamp(
+            float(home_strength["rating"]) - float(away_strength["rating"]),
+            -500.0,
+            500.0,
         )
-        factor = math.exp((power_diff / 25.0) * 0.32)
-        factor = clamp(factor, .68, 1.47)
+
+        # A modest home advantage. It cannot erase a large global Elo gap.
+        effective_diff = elo_diff + 55.0
+
+        # Translate Elo gap into attack-rate adjustment. 200 Elo ≈ meaningful
+        # superiority, while still retaining a realistic upset probability.
+        factor = math.exp((effective_diff / 400.0) * 0.72)
+        factor = clamp(factor, .58, 1.72)
         hx *= factor
         ax /= factor
 
@@ -1447,6 +1638,15 @@ def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None):
             "difference": round(
                 (home_power["rating"] - away_power["rating"])
                 if home_power and away_power else 0.0,
+                1
+            ),
+        },
+        "strength": {
+            "home": home_strength,
+            "away": away_strength,
+            "difference": round(
+                (home_strength["rating"] - away_strength["rating"])
+                if home_strength and away_strength else 0.0,
                 1
             ),
         },
@@ -1688,7 +1888,7 @@ def health():
     return {
         "ok": True,
         "app": APP_NAME,
-        "version": "7.0",
+        "version": "8.0",
         "providers": {
             "football-data": bool(FOOTBALL_DATA_API_KEY),
             "espn": True,
@@ -1781,10 +1981,17 @@ def analyze(req: AnalyzeRequest):
     home_power = team_power_rating(hr, home)
     away_power = team_power_rating(ar, away)
 
+    home_global = external_global_rating(home.name)
+    away_global = external_global_rating(away.name)
+    home_strength = hybrid_strength(home_global, home_power)
+    away_strength = hybrid_strength(away_global, away_power)
+
     pred = model_prediction(
         hs, aas, hv, av, h2h,
         home_power=home_power,
         away_power=away_power,
+        home_strength=home_strength,
+        away_strength=away_strength,
     )
 
     return {
@@ -1815,6 +2022,6 @@ def analyze(req: AnalyzeRequest):
             "source_home": home.provider,
             "source_away": away.provider,
             "football_data_enabled": bool(FOOTBALL_DATA_API_KEY),
-            "note": ("v7 adds opponent-adjusted Power Rating before Dixon-Coles Poisson."),
+            "note": ("v8 anchors predictions to dynamic Global Elo (national teams / clubs), then blends opponent-adjusted recent form before Dixon-Coles Poisson."),
         },
     }
