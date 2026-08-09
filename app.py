@@ -15,14 +15,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-APP_NAME = "Football Edge v5.3-debug"
+APP_NAME = "Football Edge v5.4"
 BASE_DIR = Path(__file__).resolve().parent
 
 THESPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json/123"
 FOTMOB_BASE = "https://www.fotmob.com/api"
 FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
 ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer"
-ESPN_WEB_BASE = "https://site.web.api.espn.com/apis/site/v2/sports/soccer"
 
 # Curated ESPN soccer competitions. The same ESPN team ID is often reusable
 # across competitions, so we can combine schedules from multiple competitions.
@@ -65,7 +64,7 @@ UA = (
 CACHE: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 600
 
-app = FastAPI(title=APP_NAME, version="5.3-debug")
+app = FastAPI(title=APP_NAME, version="5.4")
 
 
 class AnalyzeRequest(BaseModel):
@@ -325,86 +324,50 @@ def _dedupe_events(events: list[dict]) -> list[dict]:
     return out
 
 
-def espn_all_schedule_events(team: TeamRef, n=20) -> list[dict]:
-    """Use ESPN's all-competitions team schedule endpoint.
-
-    This mirrors the ESPN team Results page much better than competition-scoped
-    schedule endpoints, because it aggregates matches across competitions.
-    """
-    events = []
-    now = datetime.now()
-
-    # The all namespace can usually return past results without a season filter.
-    url = f"{ESPN_WEB_BASE}/all/teams/{team.id}/schedule"
-
-    param_sets = [
-        {},
-        {"season": now.year},
-        {"season": now.year - 1},
-        {"season": now.year - 2},
-    ]
-
-    for params in param_sets:
-        try:
-            data = http_json(url, params=params)
-        except RuntimeError:
-            continue
-
-        for raw in data.get("events") or []:
-            # The all endpoint may omit league metadata, so use "all" as fallback.
-            e = parse_espn_event(raw, "ESPN All Competitions")
-            if not e:
-                continue
-            if not _team_name_matches_event(e, team):
-                continue
-            events.append(e)
-
-        events = _dedupe_events(events)
-        if len(events) >= max(n, 10):
-            break
-
-    return events[:max(n, 30)]
-
-
 def espn_team_events(team: TeamRef, n=20) -> list[dict]:
-    # 1) Best route: ESPN "all" namespace, which aggregates team results across
-    # competitions and matches what the ESPN Results page displays.
-    events = espn_all_schedule_events(team, n)
-    if len(events) >= min(n, 8):
-        return events
+    """Collect completed ESPN matches from competition scoreboards.
 
-    # 2) Fallback: competition-history scan from v5.2.
-    fallback_events = list(events)
+    ESPN's guessed `/all/teams/{id}/schedule` route is not reliable and can
+    return 403. Scoreboards are the production path because they expose the
+    completed event objects needed by the model without relying on that route.
+    """
     now = datetime.now()
+    events: list[dict] = []
 
     is_known_national = norm(team.name) in ESPN_KNOWN
     leagues = ESPN_NATIONAL_LEAGUES if is_known_national else ESPN_LEAGUES
 
-    windows = [
-        (datetime(now.year - 1, 1, 1), now),
-        (datetime(now.year - 2, 1, 1), datetime(now.year - 1, 12, 31)),
-        (datetime(now.year - 3, 1, 1), datetime(now.year - 2, 12, 31)),
-    ]
+    # Scan recent calendar years. National-team schedules are sparse, so a
+    # wider history is useful and still inexpensive because responses cache.
+    windows = []
+    for year in range(now.year, now.year - 5, -1):
+        end_date = now if year == now.year else datetime(year, 12, 31)
+        windows.append((datetime(year, 1, 1), end_date))
 
     for league in leagues:
         for start_date, end_date in windows:
-            for e in _espn_scoreboard_events(league, start_date, end_date):
+            rows = _espn_scoreboard_events(league, start_date, end_date)
+            for e in rows:
                 if _team_name_matches_event(e, team):
-                    fallback_events.append(e)
+                    events.append(e)
 
-        fallback_events = _dedupe_events(fallback_events)
-        if len(fallback_events) >= max(n, 10):
+            events = _dedupe_events(events)
+            if len(events) >= max(n, 10):
+                break
+
+        if len(events) >= max(n, 10):
             break
 
-    # 3) Final ESPN fallback: scoped team schedule endpoints.
-    if len(fallback_events) < max(n, 8):
+    # A competition-scoped team schedule is only a secondary fallback.
+    # Some namespaces return 403, so every failure is deliberately a soft miss.
+    if len(events) < max(n, 8):
         preferred = []
-        if team.alt_ids and team.alt_ids.get("league"):
+        if team.alt_ids and team.alt_ids.get("league") not in (None, "", "all"):
             preferred.append(team.alt_ids["league"])
         schedule_leagues = preferred + [x for x in leagues if x not in preferred]
 
         for league in schedule_leagues:
-            for season in (now.year, now.year - 1, now.year - 2):
+            for season in range(now.year, now.year - 5, -1):
                 try:
                     data = http_json(
                         f"{ESPN_BASE}/{league}/teams/{team.id}/schedule",
@@ -416,13 +379,13 @@ def espn_team_events(team: TeamRef, n=20) -> list[dict]:
                 for raw in data.get("events") or []:
                     e = parse_espn_event(raw, league)
                     if e and _team_name_matches_event(e, team):
-                        fallback_events.append(e)
+                        events.append(e)
 
-            fallback_events = _dedupe_events(fallback_events)
-            if len(fallback_events) >= max(n, 10):
+            events = _dedupe_events(events)
+            if len(events) >= max(n, 10):
                 break
 
-    return _dedupe_events(fallback_events)[:max(n, 30)]
+    return _dedupe_events(events)[:max(n, 30)]
 
 
 # -----------------------------
@@ -1119,13 +1082,8 @@ def debug_team(team_name: str):
 
     tests = []
 
-    # Test the v5.3 guessed all-competition route as a diagnostic only.
-    tests.append({
-        "name": "all-web-no-season",
-        **debug_get(f"{ESPN_WEB_BASE}/all/teams/{resolved.id}/schedule"),
-    })
-
-    # Test the documented competition-scoped schedule path.
+    # Test competition-scoped schedule paths. Some ESPN namespaces may return
+    # 403; that is diagnostic information, not a fatal application error.
     for league in leagues:
         for season in (current_year, current_year - 1, current_year - 2):
             row = debug_get(
@@ -1182,7 +1140,7 @@ def health():
     return {
         "ok": True,
         "app": APP_NAME,
-        "version": "5.3-debug",
+        "version": "5.4",
         "providers": {
             "football-data": bool(FOOTBALL_DATA_API_KEY),
             "espn": True,
@@ -1284,9 +1242,8 @@ def analyze(req: AnalyzeRequest):
             "source_away": away.provider,
             "football_data_enabled": bool(FOOTBALL_DATA_API_KEY),
             "note": (
-                "v5.3 provider router: football-data.org when configured, then ESPN "
-                "all-competitions team schedule, ESPN competition scan, "
-                "TheSportsDB, then FotMob fallback."
+                "v5.4 provider router: football-data.org when configured, then ESPN "
+                "competition scoreboards/schedules, TheSportsDB, then FotMob fallback."
             ),
         },
     }
