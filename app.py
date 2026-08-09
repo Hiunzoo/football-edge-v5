@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 import time
 from dataclasses import dataclass, asdict
@@ -14,18 +15,23 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-APP_NAME = "Football Edge v5 Online"
+APP_NAME = "Football Edge v5.1"
 BASE_DIR = Path(__file__).resolve().parent
-FOTMOB = "https://www.fotmob.com/api"
+
+THESPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json/123"
+FOTMOB_BASE = "https://www.fotmob.com/api"
+FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
+FOOTBALL_DATA_API_KEY = os.getenv("FOOTBALL_DATA_API_KEY", "").strip()
+
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
 )
 
-app = FastAPI(title=APP_NAME, version="5.0")
-
 CACHE: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 600
+
+app = FastAPI(title=APP_NAME, version="5.1")
 
 
 class AnalyzeRequest(BaseModel):
@@ -36,8 +42,11 @@ class AnalyzeRequest(BaseModel):
 
 @dataclass
 class TeamRef:
-    id: int
+    id: str
     name: str
+    provider: str
+    league_ids: list[str] | None = None
+    alt_ids: dict[str, str] | None = None
 
 
 def cache_get(key: str):
@@ -55,45 +64,35 @@ def cache_set(key: str, value: Any):
     CACHE[key] = (time.time(), value)
 
 
-def get_json(path: str, params: dict | None = None) -> Any:
+def http_json(url: str, *, params=None, headers=None, timeout=16):
     params = params or {}
-    key = path + repr(sorted(params.items()))
+    headers = headers or {}
+    key = url + "?" + repr(sorted(params.items())) + repr(sorted(headers.items()))
     cached = cache_get(key)
     if cached is not None:
         return cached
 
     try:
         r = requests.get(
-            FOTMOB + path,
+            url,
             params=params,
-            timeout=18,
-            headers={
-                "User-Agent": UA,
-                "Accept": "application/json,text/plain,*/*",
-                "Referer": "https://www.fotmob.com/",
-            },
+            headers={"User-Agent": UA, "Accept": "application/json", **headers},
+            timeout=timeout,
         )
         if r.status_code == 429:
-            raise HTTPException(429, detail="FotMob 暫時限制請求，請稍後再試。")
+            raise RuntimeError("rate_limited")
         if r.status_code in (401, 403):
-            raise HTTPException(502, detail="FotMob 暫時拒絕伺服器存取，請稍後再試。")
+            raise RuntimeError("forbidden")
         if r.status_code == 404:
-            raise HTTPException(404, detail="FotMob 找不到該資料端點。")
+            raise RuntimeError("not_found")
         r.raise_for_status()
-
-        ct = (r.headers.get("content-type") or "").lower()
-        if "json" not in ct:
-            raise HTTPException(
-                502,
-                detail="FotMob 回傳的不是 JSON，可能是暫時封鎖或端點改版。",
-            )
         data = r.json()
         cache_set(key, data)
         return data
-    except HTTPException:
-        raise
     except requests.RequestException as e:
-        raise HTTPException(502, detail=f"連線 FotMob 失敗：{type(e).__name__}")
+        raise RuntimeError(type(e).__name__) from e
+    except ValueError as e:
+        raise RuntimeError("invalid_json") from e
 
 
 def norm(s: str | None) -> str:
@@ -125,94 +124,268 @@ def recursive_dicts(obj: Any):
             yield from recursive_dicts(item)
 
 
-KNOWN_NATIONAL_TEAMS = {
-    "denmark": TeamRef(8238, "Denmark"),
-    "norway": TeamRef(8492, "Norway"),
+# -----------------------------
+# TheSportsDB
+# -----------------------------
+
+def tsdb_search_team(query: str) -> TeamRef | None:
+    try:
+        data = http_json(
+            THESPORTSDB_BASE + "/searchteams.php",
+            params={"t": query},
+        )
+    except RuntimeError:
+        return None
+
+    teams = data.get("teams") or []
+    scored = []
+    for t in teams:
+        name = t.get("strTeam")
+        if not name:
+            continue
+        score = sim(query, name)
+        if score < .45:
+            continue
+        league_ids = []
+        for k, v in t.items():
+            if k.startswith("idLeague") and v:
+                league_ids.append(str(v))
+        scored.append((
+            score,
+            TeamRef(
+                id=str(t.get("idTeam")),
+                name=name,
+                provider="thesportsdb",
+                league_ids=list(dict.fromkeys(league_ids)),
+                alt_ids={},
+            )
+        ))
+
+    if not scored:
+        return None
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[0][1]
+
+
+def parse_tsdb_event(e: dict) -> dict | None:
+    hs, aas = e.get("intHomeScore"), e.get("intAwayScore")
+    if hs in (None, "") or aas in (None, ""):
+        return None
+    try:
+        hs, aas = int(hs), int(aas)
+    except (TypeError, ValueError):
+        return None
+
+    return {
+        "id": e.get("idEvent"),
+        "date": e.get("strTimestamp") or e.get("dateEvent"),
+        "home": e.get("strHomeTeam") or "",
+        "away": e.get("strAwayTeam") or "",
+        "home_id": str(e.get("idHomeTeam") or ""),
+        "away_id": str(e.get("idAwayTeam") or ""),
+        "home_score": hs,
+        "away_score": aas,
+        "competition": e.get("strLeague") or e.get("strEvent"),
+        "source": "TheSportsDB",
+    }
+
+
+def tsdb_team_events(team: TeamRef, n=20) -> list[dict]:
+    events = []
+    seen = set()
+
+    # 1) Previous events endpoint: free tier may return only a small number,
+    # but it is cheap and useful when available.
+    try:
+        data = http_json(
+            THESPORTSDB_BASE + "/eventslast.php",
+            params={"id": team.id},
+        )
+        for raw in data.get("results") or []:
+            e = parse_tsdb_event(raw)
+            if e:
+                key = e["id"] or (e["date"], e["home"], e["away"])
+                if key not in seen:
+                    seen.add(key)
+                    events.append(e)
+    except RuntimeError:
+        pass
+
+    # 2) Season endpoint. Free tier exposes a limited number of season events,
+    # but this often yields enough extra history to build a useful recent sample.
+    year = datetime.now().year
+    season_candidates = [
+        f"{year}-{year+1}",
+        f"{year-1}-{year}",
+        str(year),
+        str(year-1),
+    ]
+    for league_id in (team.league_ids or [])[:3]:
+        for season in season_candidates:
+            try:
+                data = http_json(
+                    THESPORTSDB_BASE + "/eventsseason.php",
+                    params={"id": league_id, "s": season},
+                )
+            except RuntimeError:
+                continue
+
+            for raw in data.get("events") or []:
+                hid = str(raw.get("idHomeTeam") or "")
+                aid = str(raw.get("idAwayTeam") or "")
+                hn = raw.get("strHomeTeam") or ""
+                an = raw.get("strAwayTeam") or ""
+                if (
+                    team.id not in (hid, aid)
+                    and sim(hn, team.name) < .90
+                    and sim(an, team.name) < .90
+                ):
+                    continue
+                e = parse_tsdb_event(raw)
+                if e:
+                    key = e["id"] or (e["date"], e["home"], e["away"])
+                    if key not in seen:
+                        seen.add(key)
+                        events.append(e)
+
+            if len(events) >= n:
+                break
+        if len(events) >= n:
+            break
+
+    events.sort(key=lambda x: x.get("date") or "", reverse=True)
+    return events[:max(n, 20)]
+
+
+# -----------------------------
+# football-data.org (optional)
+# -----------------------------
+
+def fd_search_team(query: str) -> TeamRef | None:
+    if not FOOTBALL_DATA_API_KEY:
+        return None
+    try:
+        data = http_json(
+            FOOTBALL_DATA_BASE + "/teams",
+            params={"limit": 500},
+            headers={"X-Auth-Token": FOOTBALL_DATA_API_KEY},
+        )
+    except RuntimeError:
+        return None
+
+    scored = []
+    for t in data.get("teams") or []:
+        names = [t.get("name"), t.get("shortName"), t.get("tla")]
+        score = max([sim(query, n) for n in names if n] or [0])
+        if score >= .50:
+            scored.append((
+                score,
+                TeamRef(
+                    id=str(t.get("id")),
+                    name=t.get("name") or t.get("shortName"),
+                    provider="football-data",
+                    league_ids=[],
+                    alt_ids={},
+                )
+            ))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[0][1]
+
+
+def fd_team_events(team: TeamRef, n=20) -> list[dict]:
+    if not FOOTBALL_DATA_API_KEY:
+        return []
+    try:
+        data = http_json(
+            FOOTBALL_DATA_BASE + f"/teams/{team.id}/matches",
+            params={"status": "FINISHED", "limit": min(max(n, 20), 100)},
+            headers={"X-Auth-Token": FOOTBALL_DATA_API_KEY},
+        )
+    except RuntimeError:
+        return []
+
+    out = []
+    for m in data.get("matches") or []:
+        score = (m.get("score") or {}).get("fullTime") or {}
+        hs, aas = score.get("home"), score.get("away")
+        if hs is None or aas is None:
+            continue
+        ht, at = m.get("homeTeam") or {}, m.get("awayTeam") or {}
+        comp = m.get("competition") or {}
+        out.append({
+            "id": m.get("id"),
+            "date": m.get("utcDate"),
+            "home": ht.get("name") or "",
+            "away": at.get("name") or "",
+            "home_id": str(ht.get("id") or ""),
+            "away_id": str(at.get("id") or ""),
+            "home_score": int(hs),
+            "away_score": int(aas),
+            "competition": comp.get("name"),
+            "source": "football-data.org",
+        })
+    out.sort(key=lambda x: x.get("date") or "", reverse=True)
+    return out
+
+
+# -----------------------------
+# FotMob fallback
+# -----------------------------
+
+KNOWN_FOTMOB = {
+    "denmark": TeamRef("8238", "Denmark", "fotmob", [], {}),
+    "norway": TeamRef("8492", "Norway", "fotmob", [], {}),
 }
 
 
-def candidates_from_search(data: Any, query: str) -> list[TeamRef]:
-    out: list[tuple[float, TeamRef]] = []
-    for d in recursive_dicts(data):
-        name = d.get("name") or d.get("localizedName") or d.get("title") or d.get("teamName")
-        raw_id = d.get("id") or d.get("teamId")
-        if not name or raw_id is None:
-            continue
-        try:
-            tid = int(raw_id)
-        except (TypeError, ValueError):
-            continue
-
-        typ = str(d.get("type") or d.get("entityType") or "").lower()
-        score = sim(query, str(name))
-        if "team" in typ:
-            score += .12
-        if score >= .46:
-            out.append((score, TeamRef(tid, str(name))))
-
-    out.sort(key=lambda x: x[0], reverse=True)
-    seen = set()
-    refs = []
-    for _, ref in out:
-        if ref.id not in seen:
-            seen.add(ref.id)
-            refs.append(ref)
-    return refs
-
-
-def search_team(query: str) -> TeamRef:
-    q = query.strip()
-    if len(q) < 2:
-        raise HTTPException(400, detail="球隊名稱至少輸入 2 個字。")
-
-    # Explicit fallback for common national-team cases we verified.
-    known = KNOWN_NATIONAL_TEAMS.get(norm(q))
+def fotmob_search_team(query: str) -> TeamRef | None:
+    known = KNOWN_FOTMOB.get(norm(query))
     if known:
         return known
 
-    errors = []
     for path in ("/search/suggest", "/searchData"):
         try:
-            data = get_json(path, {"term": q})
-            cands = candidates_from_search(data, q)
-            if cands:
-                return cands[0]
-        except HTTPException as e:
-            errors.append(str(e.detail))
+            data = http_json(
+                FOTMOB_BASE + path,
+                params={"term": query},
+                headers={"Referer": "https://www.fotmob.com/"},
+            )
+        except RuntimeError:
+            continue
 
-    raise HTTPException(
-        404,
-        detail=f"找不到「{q}」。建議使用正式英文隊名。"
-        + (f" 搜尋診斷：{' / '.join(errors)}" if errors else ""),
-    )
+        candidates = []
+        for d in recursive_dicts(data):
+            name = d.get("name") or d.get("localizedName") or d.get("teamName") or d.get("title")
+            raw_id = d.get("id") or d.get("teamId")
+            if not name or raw_id is None:
+                continue
+            score = sim(query, str(name))
+            if score >= .48:
+                candidates.append((score, TeamRef(str(raw_id), str(name), "fotmob", [], {})))
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            return candidates[0][1]
+    return None
 
 
-def side_name(side: Any) -> str | None:
-    if isinstance(side, str):
-        return side
+def _side_name(side):
     if isinstance(side, dict):
         return side.get("name") or side.get("teamName") or side.get("shortName")
-    return None
+    return side if isinstance(side, str) else None
 
 
-def side_id(side: Any) -> int | None:
+def _side_id(side):
     if not isinstance(side, dict):
-        return None
-    for key in ("id", "teamId"):
-        if key in side:
-            try:
-                return int(side[key])
-            except (TypeError, ValueError):
-                return None
-    return None
+        return ""
+    return str(side.get("id") or side.get("teamId") or "")
 
 
-def score_num(v: Any) -> int | None:
+def _score_num(v):
     if v is None:
         return None
-    if isinstance(v, bool):
-        return None
-    if isinstance(v, (int, float)):
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
         return int(v)
     if isinstance(v, str):
         m = re.search(r"\d+", v)
@@ -220,42 +393,28 @@ def score_num(v: Any) -> int | None:
     if isinstance(v, dict):
         for k in ("current", "display", "normaltime", "score", "total"):
             if k in v:
-                x = score_num(v[k])
+                x = _score_num(v[k])
                 if x is not None:
                     return x
     return None
 
 
-def parse_date(d: dict) -> str | None:
-    for key in ("utcTime", "startDate", "date", "dateEvent"):
-        if d.get(key):
-            return str(d[key])
-    status = d.get("status")
-    if isinstance(status, dict):
-        for key in ("utcTime", "startDate", "date"):
-            if status.get(key):
-                return str(status[key])
-    return None
-
-
-def event_from(d: dict) -> dict | None:
+def fotmob_event_from_dict(d):
     home = d.get("home") or d.get("homeTeam")
     away = d.get("away") or d.get("awayTeam")
-    hn = side_name(home) or d.get("homeName") or d.get("strHomeTeam")
-    an = side_name(away) or d.get("awayName") or d.get("strAwayTeam")
+    hn = _side_name(home) or d.get("homeName")
+    an = _side_name(away) or d.get("awayName")
     if not hn or not an:
         return None
 
-    hs = score_num(d.get("homeScore") or d.get("scoreHome") or d.get("homeGoals") or d.get("intHomeScore"))
-    aas = score_num(d.get("awayScore") or d.get("scoreAway") or d.get("awayGoals") or d.get("intAwayScore"))
-
+    hs = _score_num(d.get("homeScore") or d.get("scoreHome") or d.get("homeGoals"))
+    aas = _score_num(d.get("awayScore") or d.get("scoreAway") or d.get("awayGoals"))
     if hs is None or aas is None:
         score_str = d.get("scoreStr") or d.get("score") or d.get("result")
         if isinstance(score_str, str):
             m = re.search(r"(\d+)\s*[-:]\s*(\d+)", score_str)
             if m:
                 hs, aas = int(m.group(1)), int(m.group(2))
-
     if hs is None or aas is None:
         return None
 
@@ -263,78 +422,156 @@ def event_from(d: dict) -> dict | None:
     if isinstance(comp, dict):
         comp = comp.get("name")
 
+    date = d.get("utcTime") or d.get("startDate") or d.get("date")
+    if not date and isinstance(d.get("status"), dict):
+        date = d["status"].get("utcTime") or d["status"].get("startDate")
+
     return {
         "id": d.get("id") or d.get("matchId") or d.get("eventId"),
-        "date": parse_date(d),
+        "date": str(date or ""),
         "home": str(hn),
         "away": str(an),
-        "home_id": side_id(home),
-        "away_id": side_id(away),
+        "home_id": _side_id(home),
+        "away_id": _side_id(away),
         "home_score": hs,
         "away_score": aas,
         "competition": str(comp) if comp else None,
+        "source": "FotMob",
     }
 
 
-def collect_events(payload: Any) -> list[dict]:
-    seen = set()
+def fotmob_team_events(team: TeamRef, n=20) -> list[dict]:
+    try:
+        payload = http_json(
+            FOTMOB_BASE + "/teams",
+            params={"id": team.id},
+            headers={"Referer": "https://www.fotmob.com/"},
+        )
+    except RuntimeError:
+        return []
+
     out = []
+    seen = set()
     for d in recursive_dicts(payload):
-        e = event_from(d)
+        e = fotmob_event_from_dict(d)
         if not e:
             continue
-        key = e.get("id") or (
-            e["date"], e["home"], e["away"], e["home_score"], e["away_score"]
-        )
+        key = e["id"] or (e["date"], e["home"], e["away"])
         if key in seen:
             continue
         seen.add(key)
         out.append(e)
-    out.sort(key=lambda e: e.get("date") or "", reverse=True)
-    return out
+    out.sort(key=lambda x: x.get("date") or "", reverse=True)
+    return out[:max(n, 20)]
 
 
-def belongs(e: dict, t: TeamRef) -> bool:
+# -----------------------------
+# Provider router
+# -----------------------------
+
+def resolve_team(query: str) -> list[TeamRef]:
+    refs = []
+
+    # If user configured an official football-data token, try it first.
+    fd = fd_search_team(query)
+    if fd:
+        refs.append(fd)
+
+    ts = tsdb_search_team(query)
+    if ts:
+        refs.append(ts)
+
+    fm = fotmob_search_team(query)
+    if fm:
+        refs.append(fm)
+
+    # Deduplicate by normalized name/provider combo.
+    uniq = []
+    seen = set()
+    for r in refs:
+        k = (r.provider, r.id)
+        if k not in seen:
+            seen.add(k)
+            uniq.append(r)
+    return uniq
+
+
+def collect_best_events(team_refs: list[TeamRef], n=20):
+    diagnostics = []
+    best_ref = None
+    best_events = []
+
+    for ref in team_refs:
+        if ref.provider == "football-data":
+            events = fd_team_events(ref, n)
+        elif ref.provider == "thesportsdb":
+            events = tsdb_team_events(ref, n)
+        else:
+            events = fotmob_team_events(ref, n)
+
+        diagnostics.append({
+            "provider": ref.provider,
+            "team": ref.name,
+            "team_id": ref.id,
+            "events": len(events),
+        })
+
+        if len(events) > len(best_events):
+            best_ref = ref
+            best_events = events
+
+        if len(events) >= max(5, min(n, 10)):
+            break
+
+    return best_ref, best_events, diagnostics
+
+
+# -----------------------------
+# Analysis
+# -----------------------------
+
+def belongs(e, t: TeamRef):
     return (
-        e.get("home_id") == t.id
-        or e.get("away_id") == t.id
-        or sim(e.get("home"), t.name) > .87
-        or sim(e.get("away"), t.name) > .87
+        str(e.get("home_id") or "") == str(t.id)
+        or str(e.get("away_id") or "") == str(t.id)
+        or sim(e.get("home"), t.name) > .88
+        or sim(e.get("away"), t.name) > .88
     )
 
 
-def versus(e: dict, a: TeamRef, b: TeamRef) -> bool:
-    ids = {e.get("home_id"), e.get("away_id")}
-    if a.id in ids and b.id in ids:
-        return True
+def versus(e, a: TeamRef, b: TeamRef):
     return (
-        max(sim(e.get("home"), a.name), sim(e.get("away"), a.name)) > .87
-        and max(sim(e.get("home"), b.name), sim(e.get("away"), b.name)) > .87
+        max(sim(e.get("home"), a.name), sim(e.get("away"), a.name)) > .88
+        and max(sim(e.get("home"), b.name), sim(e.get("away"), b.name)) > .88
     )
 
 
-def recent(events: list[dict], t: TeamRef, n: int) -> list[dict]:
-    return [e for e in events if belongs(e, t)][:n]
+def recent(events, team, n):
+    return [e for e in events if belongs(e, team)][:n]
 
 
-def stats(events: list[dict], t: TeamRef, venue: str | None = None) -> dict:
+def team_stats(events, team, venue=None):
     gf = ga = w = d = l = 0
     form = []
     used = []
     for e in events:
-        is_home = e.get("home_id") == t.id or sim(e["home"], t.name) > .87
+        is_home = (
+            str(e.get("home_id") or "") == str(team.id)
+            or sim(e.get("home"), team.name) > .88
+        )
         if venue == "home" and not is_home:
             continue
         if venue == "away" and is_home:
             continue
+
         a, b = (
             (e["home_score"], e["away_score"])
             if is_home
             else (e["away_score"], e["home_score"])
         )
+        used.append(e)
         gf += a
         ga += b
-        used.append(e)
         if a > b:
             w += 1
             form.append("W")
@@ -358,7 +595,7 @@ def stats(events: list[dict], t: TeamRef, venue: str | None = None) -> dict:
     }
 
 
-def poisson(k: int, lam: float) -> float:
+def poisson(k, lam):
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
 
@@ -366,7 +603,7 @@ def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
 
-def dc_tau(h: int, a: int, hx: float, ax: float, rho: float = -0.08) -> float:
+def dc_tau(h, a, hx, ax, rho=-0.08):
     if h == 0 and a == 0:
         return max(.05, 1 - hx * ax * rho)
     if h == 0 and a == 1:
@@ -378,7 +615,7 @@ def dc_tau(h: int, a: int, hx: float, ax: float, rho: float = -0.08) -> float:
     return 1.0
 
 
-def prediction(hs, aas, hv, av, h2h):
+def model_prediction(hs, aas, hv, av, h2h):
     hgf = hv["gf_avg"] if hv["played"] >= 2 else hs["gf_avg"]
     hga = hv["ga_avg"] if hv["played"] >= 2 else hs["ga_avg"]
     agf = av["gf_avg"] if av["played"] >= 2 else aas["gf_avg"]
@@ -392,9 +629,9 @@ def prediction(hs, aas, hv, av, h2h):
     hx = ((hgf + aga) / 2) * 1.08
     ax = ((agf + hga) / 2) * .96
 
-    edge = clamp(hs["ppg"] - aas["ppg"], -1.5, 1.5)
-    hx *= 1 + edge * .04
-    ax *= 1 - edge * .03
+    ppg_edge = clamp(hs["ppg"] - aas["ppg"], -1.5, 1.5)
+    hx *= 1 + ppg_edge * .04
+    ax *= 1 - ppg_edge * .03
 
     if h2h:
         last = h2h[:5]
@@ -438,7 +675,11 @@ def prediction(hs, aas, hv, av, h2h):
 
     sample = min(hs["played"] + aas["played"], 20)
     venue_sample = min(hv["played"] + av["played"], 10)
-    conf = int(clamp(48 + sample * 1.3 + venue_sample * 1.2 + min(len(h2h), 5) * 2.0, 45, 90))
+    conf = int(clamp(
+        45 + sample * 1.35 + venue_sample * 1.1 + min(len(h2h), 5) * 2.0,
+        40,
+        90
+    ))
 
     return {
         "expected_goals": {
@@ -475,8 +716,12 @@ def health():
     return {
         "ok": True,
         "app": APP_NAME,
-        "version": "5.0",
-        "provider": "FotMob web JSON adapter",
+        "version": "5.1",
+        "providers": {
+            "football-data": bool(FOOTBALL_DATA_API_KEY),
+            "thesportsdb": True,
+            "fotmob_fallback": True,
+        },
     }
 
 
@@ -487,17 +732,21 @@ def analyze(req: AnalyzeRequest):
 
     n = max(5, min(req.recent_matches, 20))
 
-    home = search_team(req.home_team)
-    away = search_team(req.away_team)
+    home_refs = resolve_team(req.home_team)
+    away_refs = resolve_team(req.away_team)
 
-    if home.id == away.id:
-        raise HTTPException(400, detail="兩個輸入被辨識成同一支球隊。")
+    if not home_refs:
+        raise HTTPException(404, detail=f"找不到主隊「{req.home_team}」。")
+    if not away_refs:
+        raise HTTPException(404, detail=f"找不到客隊「{req.away_team}」。")
 
-    home_payload = get_json("/teams", {"id": home.id})
-    away_payload = get_json("/teams", {"id": away.id})
+    home, home_all, home_diag = collect_best_events(home_refs, n)
+    away, away_all, away_diag = collect_best_events(away_refs, n)
 
-    home_all = collect_events(home_payload)
-    away_all = collect_events(away_payload)
+    if not home:
+        home = home_refs[0]
+    if not away:
+        away = away_refs[0]
 
     hr = recent(home_all, home, n)
     ar = recent(away_all, away, n)
@@ -505,7 +754,14 @@ def analyze(req: AnalyzeRequest):
     if len(hr) < 3 or len(ar) < 3:
         raise HTTPException(
             422,
-            detail=f"可取得近期賽事不足：{home.name} {len(hr)} 場、{away.name} {len(ar)} 場。",
+            detail={
+                "message": (
+                    f"目前可取得的近期賽事仍不足："
+                    f"{home.name} {len(hr)} 場、{away.name} {len(ar)} 場。"
+                ),
+                "home_providers": home_diag,
+                "away_providers": away_diag,
+            },
         )
 
     union = []
@@ -523,12 +779,12 @@ def analyze(req: AnalyzeRequest):
     h2h.sort(key=lambda e: e.get("date") or "", reverse=True)
     h2h = h2h[:10]
 
-    hs = stats(hr, home)
-    aas = stats(ar, away)
-    hv = stats(hr, home, "home")
-    av = stats(ar, away, "away")
+    hs = team_stats(hr, home)
+    aas = team_stats(ar, away)
+    hv = team_stats(hr, home, "home")
+    av = team_stats(ar, away, "away")
 
-    pred = prediction(hs, aas, hv, av, h2h)
+    pred = model_prediction(hs, aas, hv, av, h2h)
 
     return {
         "teams": {
@@ -547,9 +803,18 @@ def analyze(req: AnalyzeRequest):
         },
         "h2h": h2h,
         "prediction": pred,
+        "diagnostics": {
+            "home": home_diag,
+            "away": away_diag,
+        },
         "meta": {
             "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "source": "FotMob public web JSON adapter",
-            "note": "Non-official endpoint; server-side access can still be rate-limited or changed by FotMob.",
+            "source_home": home.provider,
+            "source_away": away.provider,
+            "football_data_enabled": bool(FOOTBALL_DATA_API_KEY),
+            "note": (
+                "v5.1 provider router: football-data.org when configured, "
+                "then TheSportsDB, then FotMob fallback."
+            ),
         },
     }
