@@ -11,11 +11,11 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-APP_NAME = "Football Edge v6.1 Universal Collector"
+APP_NAME = "Football Edge v7"
 BASE_DIR = Path(__file__).resolve().parent
 
 THESPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json/123"
@@ -65,7 +65,7 @@ UA = (
 CACHE: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 600
 
-app = FastAPI(title=APP_NAME, version="6.1")
+app = FastAPI(title=APP_NAME, version="7.0")
 
 
 class AnalyzeRequest(BaseModel):
@@ -1150,6 +1150,158 @@ def team_stats(events, team, venue=None):
     }
 
 
+def weighted_team_form(events, team):
+    """Recency-weighted form used by the power layer.
+
+    Recent matches matter more, but this score alone is NOT the final rating;
+    opponent quality is added separately.
+    """
+    total_w = pts = gf = ga = 0.0
+    for i, e in enumerate(events[:15]):
+        w = 0.90 ** i
+        is_home = (
+            str(e.get("home_id") or "") == str(team.id)
+            or sim(e.get("home"), team.name) > .76
+        )
+        scored, conceded = (
+            (e["home_score"], e["away_score"])
+            if is_home else
+            (e["away_score"], e["home_score"])
+        )
+        p = 3 if scored > conceded else (1 if scored == conceded else 0)
+        total_w += w
+        pts += p * w
+        gf += scored * w
+        ga += conceded * w
+
+    if total_w <= 0:
+        return {"ppg": 1.5, "gd": 0.0, "gf": 1.2, "ga": 1.2}
+
+    return {
+        "ppg": pts / total_w,
+        "gd": (gf - ga) / total_w,
+        "gf": gf / total_w,
+        "ga": ga / total_w,
+    }
+
+
+def basic_power_from_events(events, team):
+    form = weighted_team_form(events, team)
+    # Neutral team ~= 50. Strong recent performance can move the rating,
+    # but is deliberately capped because schedule quality is handled separately.
+    rating = (
+        50
+        + (form["ppg"] - 1.5) * 13.0
+        + clamp(form["gd"], -2.0, 2.0) * 7.0
+    )
+    return clamp(rating, 25, 82)
+
+
+def _event_opponent(e, team):
+    is_home = (
+        str(e.get("home_id") or "") == str(team.id)
+        or sim(e.get("home"), team.name) > .76
+    )
+    if is_home:
+        return {
+            "name": e.get("away") or "",
+            "id": str(e.get("away_id") or ""),
+            "source": e.get("source") or "",
+        }
+    return {
+        "name": e.get("home") or "",
+        "id": str(e.get("home_id") or ""),
+        "source": e.get("source") or "",
+    }
+
+
+def quick_opponent_power(opponent):
+    """Estimate opponent strength without recursive opponent-quality calls.
+
+    Cached aggressively because the same opponent can appear in many analyses.
+    """
+    name = (opponent.get("name") or "").strip()
+    oid = str(opponent.get("id") or "")
+    source = str(opponent.get("source") or "")
+    if not name:
+        return 50.0
+
+    key = f"power:{norm(name)}:{oid}:{source}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    refs = []
+    # If an ESPN event supplied the opponent ID, use it directly.
+    if source.upper().startswith("ESPN") and oid:
+        refs.append(TeamRef(oid, name, "espn", [], {"league": "all"}))
+
+    # Add dynamically resolved refs as fallbacks.
+    try:
+        for r in resolve_team(name):
+            if (r.provider, r.id) not in {(x.provider, x.id) for x in refs}:
+                refs.append(r)
+    except Exception:
+        pass
+
+    best = []
+    best_ref = None
+    for ref in refs[:4]:
+        try:
+            if ref.provider == "espn":
+                rows = espn_team_events(ref, 6)
+            elif ref.provider == "thesportsdb":
+                rows = tsdb_team_events(ref, 6)
+            elif ref.provider == "football-data":
+                rows = fd_team_events(ref, 6)
+            else:
+                rows = fotmob_team_events(ref, 6)
+        except Exception:
+            rows = []
+
+        if len(rows) > len(best):
+            best = rows
+            best_ref = ref
+        if len(best) >= 5:
+            break
+
+    rating = basic_power_from_events(best, best_ref) if best_ref and best else 50.0
+    cache_set(key, rating)
+    return rating
+
+
+def team_power_rating(events, team):
+    """Opponent-adjusted 0-100-ish team strength layer."""
+    base = basic_power_from_events(events, team)
+
+    # Use only a handful of recent distinct opponents to control latency.
+    opponents = []
+    seen = set()
+    for e in events[:10]:
+        opp = _event_opponent(e, team)
+        k = norm(opp["name"])
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        opponents.append(opp)
+        if len(opponents) >= 5:
+            break
+
+    opp_ratings = [quick_opponent_power(o) for o in opponents]
+    schedule = sum(opp_ratings) / len(opp_ratings) if opp_ratings else 50.0
+
+    # About 35% of the opponent-quality difference is transferred into rating.
+    adjusted = base + (schedule - 50.0) * 0.35
+    adjusted = clamp(adjusted, 20, 92)
+
+    return {
+        "rating": round(adjusted, 1),
+        "base_form": round(base, 1),
+        "opponent_strength": round(schedule, 1),
+        "opponents_sampled": len(opp_ratings),
+    }
+
+
 def poisson(k, lam):
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
@@ -1170,7 +1322,7 @@ def dc_tau(h, a, hx, ax, rho=-0.08):
     return 1.0
 
 
-def model_prediction(hs, aas, hv, av, h2h):
+def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None):
     hgf = hv["gf_avg"] if hv["played"] >= 2 else hs["gf_avg"]
     hga = hv["ga_avg"] if hv["played"] >= 2 else hs["ga_avg"]
     agf = av["gf_avg"] if av["played"] >= 2 else aas["gf_avg"]
@@ -1184,9 +1336,23 @@ def model_prediction(hs, aas, hv, av, h2h):
     hx = ((hgf + aga) / 2) * 1.08
     ax = ((agf + hga) / 2) * .96
 
+    # Recent form still matters, but much less than in the old model.
     ppg_edge = clamp(hs["ppg"] - aas["ppg"], -1.5, 1.5)
-    hx *= 1 + ppg_edge * .04
-    ax *= 1 - ppg_edge * .03
+    hx *= 1 + ppg_edge * .025
+    ax *= 1 - ppg_edge * .020
+
+    # Power layer: long-ish form + opponent strength.
+    # A large rating gap should materially move xG, without making upsets impossible.
+    if home_power and away_power:
+        power_diff = clamp(
+            float(home_power["rating"]) - float(away_power["rating"]),
+            -35.0,
+            35.0,
+        )
+        factor = math.exp((power_diff / 25.0) * 0.32)
+        factor = clamp(factor, .68, 1.47)
+        hx *= factor
+        ax /= factor
 
     if h2h:
         last = h2h[:5]
@@ -1274,6 +1440,15 @@ def model_prediction(hs, aas, hv, av, h2h):
         "sample_counts": {
             "home": hs["played"],
             "away": aas["played"],
+        },
+        "power": {
+            "home": home_power,
+            "away": away_power,
+            "difference": round(
+                (home_power["rating"] - away_power["rating"])
+                if home_power and away_power else 0.0,
+                1
+            ),
         },
     }
 
@@ -1428,6 +1603,81 @@ async def unhandled_exception_handler(request, exc):
     )
 
 
+def _teamref_public(ref: TeamRef) -> dict:
+    return {
+        "id": ref.id,
+        "name": ref.name,
+        "provider": ref.provider,
+        "league_ids": ref.league_ids or [],
+        "alt_ids": ref.alt_ids or {},
+    }
+
+
+def _candidate_key(ref: TeamRef):
+    return (ref.provider, str(ref.id))
+
+
+def _candidate_score(query: str, ref: TeamRef) -> float:
+    score = sim(query, ref.name)
+    qn, rn = norm(query), norm(ref.name)
+    if qn and rn:
+        # tolerate common suffix/prefix forms like Liverpool -> Liverpool FC
+        suffixes = (" fc", " cf", " afc", " sc", " calcio", " club")
+        rn2 = rn
+        for suf in suffixes:
+            if rn2.endswith(suf):
+                rn2 = rn2[:-len(suf)].strip()
+        if qn == rn2:
+            score = max(score, .995)
+        elif qn in rn2 or rn2 in qn:
+            score = max(score, .94)
+    return score
+
+
+@app.get("/api/team-search")
+def team_search(q: str = Query(..., min_length=2), limit: int = Query(6, ge=1, le=10)):
+    query = q.strip()
+    refs = resolve_team(query)
+
+    # If resolver returns too few candidates, probe individual providers directly.
+    extras = []
+    for fn in (espn_search_team, tsdb_search_team, fotmob_search_team, fd_search_team):
+        try:
+            ref = fn(query)
+            if ref:
+                extras.append(ref)
+        except Exception:
+            pass
+
+    merged = []
+    seen = set()
+    for ref in list(refs) + extras:
+        k = _candidate_key(ref)
+        if k in seen:
+            continue
+        seen.add(k)
+        merged.append(ref)
+
+    scored = sorted(
+        [(_candidate_score(query, ref), ref) for ref in merged],
+        key=lambda x: x[0],
+        reverse=True,
+    )
+
+    results = []
+    for score, ref in scored[:limit]:
+        item = _teamref_public(ref)
+        item["score"] = round(score, 3)
+        results.append(item)
+
+    auto = results[0] if results and results[0]["score"] >= .92 else None
+    return {
+        "query": query,
+        "auto_select": auto,
+        "results": results,
+    }
+
+
 @app.get("/")
 def index():
     return FileResponse(BASE_DIR / "static" / "index.html")
@@ -1438,7 +1688,7 @@ def health():
     return {
         "ok": True,
         "app": APP_NAME,
-        "version": "6.1",
+        "version": "7.0",
         "providers": {
             "football-data": bool(FOOTBALL_DATA_API_KEY),
             "espn": True,
@@ -1528,7 +1778,14 @@ def analyze(req: AnalyzeRequest):
     hv = team_stats(hr, home, "home")
     av = team_stats(ar, away, "away")
 
-    pred = model_prediction(hs, aas, hv, av, h2h)
+    home_power = team_power_rating(hr, home)
+    away_power = team_power_rating(ar, away)
+
+    pred = model_prediction(
+        hs, aas, hv, av, h2h,
+        home_power=home_power,
+        away_power=away_power,
+    )
 
     return {
         "teams": {
@@ -1558,10 +1815,6 @@ def analyze(req: AnalyzeRequest):
             "source_home": home.provider,
             "source_away": away.provider,
             "football_data_enabled": bool(FOOTBALL_DATA_API_KEY),
-            "note": (
-                "v6.1 Universal Collector: arbitrary team names are resolved dynamically through "
-                "ESPN global search/team catalogues, then schedules are fetched automatically. "
-                "TheSportsDB, FotMob and football-data.org remain provider fallbacks."
-            ),
+            "note": ("v7 adds opponent-adjusted Power Rating before Dixon-Coles Poisson."),
         },
     }
