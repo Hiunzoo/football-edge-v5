@@ -15,13 +15,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-APP_NAME = "Football Edge v5.4"
+APP_NAME = "Football Edge v5.5"
 BASE_DIR = Path(__file__).resolve().parent
 
 THESPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json/123"
 FOTMOB_BASE = "https://www.fotmob.com/api"
 FOOTBALL_DATA_BASE = "https://api.football-data.org/v4"
 ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer"
+ESPN_WEB_BASE = "https://site.web.api.espn.com/apis/site/v2/sports/soccer"
 
 # Curated ESPN soccer competitions. The same ESPN team ID is often reusable
 # across competitions, so we can combine schedules from multiple competitions.
@@ -64,7 +65,7 @@ UA = (
 CACHE: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 600
 
-app = FastAPI(title=APP_NAME, version="5.4")
+app = FastAPI(title=APP_NAME, version="5.5")
 
 
 class AnalyzeRequest(BaseModel):
@@ -188,83 +189,156 @@ def espn_search_team(query: str) -> TeamRef | None:
     if known:
         return known
 
-    best = None
-    best_score = 0.0
-    best_league = None
-
-    for league in ESPN_LEAGUES:
-        try:
-            data = http_json(f"{ESPN_BASE}/{league}/teams")
-        except RuntimeError:
-            continue
-
-        for t in _espn_team_rows(data):
+    def score_rows(rows, league="all"):
+        scored = []
+        for t in rows:
             names = [
                 t.get("displayName"),
                 t.get("name"),
                 t.get("shortDisplayName"),
                 t.get("abbreviation"),
+                t.get("location"),
             ]
             score = max([sim(query, n) for n in names if n] or [0])
-            if score > best_score:
-                raw_id = t.get("id")
-                name = t.get("displayName") or t.get("name")
-                if raw_id is not None and name:
-                    best = TeamRef(str(raw_id), str(name), "espn", [], {"league": league})
-                    best_score = score
-                    best_league = league
+            raw_id = t.get("id")
+            name = t.get("displayName") or t.get("name")
+            if raw_id is not None and name and score >= .52:
+                scored.append((
+                    score,
+                    TeamRef(str(raw_id), str(name), "espn", [], {"league": league}),
+                ))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored
 
-        if best_score >= .96:
+    # First try ESPN's all-soccer namespace. This avoids needing to know the
+    # team's competition before we know the team itself.
+    try:
+        data = http_json(f"{ESPN_BASE}/all/teams")
+        scored = score_rows(_espn_team_rows(data), "all")
+        if scored:
+            return scored[0][1]
+    except RuntimeError:
+        pass
+
+    # Fallback for installations where /all/teams is restricted.
+    best = None
+    for league in ESPN_LEAGUES:
+        try:
+            data = http_json(f"{ESPN_BASE}/{league}/teams")
+        except RuntimeError:
+            continue
+        scored = score_rows(_espn_team_rows(data), league)
+        if scored and (best is None or scored[0][0] > best[0]):
+            best = scored[0]
+        if best and best[0] >= .96:
             break
 
-    return best if best_score >= .56 else None
+    return best[1] if best else None
+
+
+def _espn_score(v: Any) -> int | None:
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    if isinstance(v, str):
+        m = re.search(r"-?\d+(?:\.\d+)?", v)
+        return int(float(m.group())) if m else None
+    if isinstance(v, dict):
+        for key in ("value", "displayValue", "display", "current", "score"):
+            if key in v:
+                x = _espn_score(v.get(key))
+                if x is not None:
+                    return x
+    return None
 
 
 def parse_espn_event(raw: dict, league: str) -> dict | None:
     comps = raw.get("competitions") or []
     if not comps:
         return None
-    comp = comps[0]
-    status = ((raw.get("status") or {}).get("type") or {})
-    completed = status.get("completed")
-    state = str(status.get("state") or "").lower()
-    if completed is not True and state not in ("post", "final"):
-        return None
+    comp = comps[0] or {}
+
+    # Soccer schedules commonly put status on the competition, not the event.
+    status_obj = raw.get("status") or comp.get("status") or {}
+    status_type = status_obj.get("type") if isinstance(status_obj, dict) else {}
+    status_type = status_type if isinstance(status_type, dict) else {}
+    completed = status_type.get("completed")
+    state = str(status_type.get("state") or "").lower()
+    description = str(
+        status_type.get("description")
+        or status_type.get("detail")
+        or status_type.get("shortDetail")
+        or ""
+    ).lower()
 
     competitors = comp.get("competitors") or []
+    if len(competitors) < 2:
+        return None
+
     home = away = None
-    for c in competitors:
+    for idx, c in enumerate(competitors):
+        if not isinstance(c, dict):
+            continue
         ha = str(c.get("homeAway") or "").lower()
         if ha == "home":
             home = c
         elif ha == "away":
             away = c
+
+    # Defensive fallback for API variants that omit homeAway.
+    if home is None or away is None:
+        ordered = [c for c in competitors if isinstance(c, dict)]
+        ordered.sort(key=lambda c: c.get("order", 99))
+        if len(ordered) >= 2:
+            home = home or ordered[0]
+            away = away or ordered[1]
+
     if not home or not away:
         return None
 
     ht = home.get("team") or {}
     at = away.get("team") or {}
-    hs = home.get("score")
-    aas = away.get("score")
-    try:
-        hs = int(float(hs))
-        aas = int(float(aas))
-    except (TypeError, ValueError):
+
+    hs = _espn_score(home.get("score"))
+    aas = _espn_score(away.get("score"))
+
+    # Results endpoint sometimes contains status variants we don't know yet.
+    # If both final scores exist, accept a past event even if "completed" is absent.
+    if hs is None or aas is None:
         return None
+
+    event_date = raw.get("date") or comp.get("date")
+    if completed is False or state in ("pre", "in"):
+        return None
+    if completed is not True and state not in ("post", "final"):
+        if any(x in description for x in ("scheduled", "postponed", "canceled", "cancelled")):
+            return None
 
     league_name = None
     l = raw.get("league") or {}
     if isinstance(l, dict):
         league_name = l.get("name") or l.get("abbreviation")
-    league_name = league_name or league
+
+    season = raw.get("season") or {}
+    if not league_name and isinstance(season, dict):
+        slug = season.get("slug")
+        if slug:
+            league_name = str(slug).replace("-", " ").title()
+
+    league_name = (
+        league_name
+        or ((comp.get("type") or {}).get("text") if isinstance(comp.get("type"), dict) else None)
+        or league
+    )
 
     return {
-        "id": raw.get("id"),
-        "date": raw.get("date"),
-        "home": ht.get("displayName") or ht.get("name") or "",
-        "away": at.get("displayName") or at.get("name") or "",
-        "home_id": str(ht.get("id") or ""),
-        "away_id": str(at.get("id") or ""),
+        "id": raw.get("id") or comp.get("id"),
+        "date": event_date,
+        "home": ht.get("displayName") or ht.get("name") or home.get("displayName") or "",
+        "away": at.get("displayName") or at.get("name") or away.get("displayName") or "",
+        "home_id": str(ht.get("id") or home.get("id") or ""),
+        "away_id": str(at.get("id") or away.get("id") or ""),
         "home_score": hs,
         "away_score": aas,
         "competition": league_name,
@@ -324,68 +398,70 @@ def _dedupe_events(events: list[dict]) -> list[dict]:
     return out
 
 
-def espn_team_events(team: TeamRef, n=20) -> list[dict]:
-    """Collect completed ESPN matches from competition scoreboards.
+def espn_all_schedule_events(team: TeamRef, n=20) -> list[dict]:
+    """Fetch completed results from ESPN's all-competitions team schedule."""
+    events = []
 
-    ESPN's guessed `/all/teams/{id}/schedule` route is not reliable and can
-    return 403. Scoreboards are the production path because they expose the
-    completed event objects needed by the model without relying on that route.
-    """
-    now = datetime.now()
-    events: list[dict] = []
+    urls = [
+        f"{ESPN_BASE}/all/teams/{team.id}/schedule",
+        f"{ESPN_WEB_BASE}/all/teams/{team.id}/schedule",
+    ]
 
-    is_known_national = norm(team.name) in ESPN_KNOWN
-    leagues = ESPN_NATIONAL_LEAGUES if is_known_national else ESPN_LEAGUES
+    for url in urls:
+        try:
+            data = http_json(url)
+        except RuntimeError:
+            continue
 
-    # Scan recent calendar years. National-team schedules are sparse, so a
-    # wider history is useful and still inexpensive because responses cache.
-    windows = []
-    for year in range(now.year, now.year - 5, -1):
-        end_date = now if year == now.year else datetime(year, 12, 31)
-        windows.append((datetime(year, 1, 1), end_date))
+        for raw in data.get("events") or []:
+            e = parse_espn_event(raw, "ESPN All Competitions")
+            if e and _team_name_matches_event(e, team):
+                events.append(e)
 
-    for league in leagues:
-        for start_date, end_date in windows:
-            rows = _espn_scoreboard_events(league, start_date, end_date)
-            for e in rows:
-                if _team_name_matches_event(e, team):
-                    events.append(e)
-
-            events = _dedupe_events(events)
-            if len(events) >= max(n, 10):
-                break
-
-        if len(events) >= max(n, 10):
+        events = _dedupe_events(events)
+        if len(events) >= min(n, 8):
             break
 
-    # A competition-scoped team schedule is only a secondary fallback.
-    # Some namespaces return 403, so every failure is deliberately a soft miss.
-    if len(events) < max(n, 8):
-        preferred = []
-        if team.alt_ids and team.alt_ids.get("league") not in (None, "", "all"):
-            preferred.append(team.alt_ids["league"])
-        schedule_leagues = preferred + [x for x in leagues if x not in preferred]
+    return events[:max(n, 30)]
 
-        for league in schedule_leagues:
-            for season in range(now.year, now.year - 5, -1):
-                try:
-                    data = http_json(
-                        f"{ESPN_BASE}/{league}/teams/{team.id}/schedule",
-                        params={"season": season},
-                    )
-                except RuntimeError:
-                    continue
 
-                for raw in data.get("events") or []:
-                    e = parse_espn_event(raw, league)
-                    if e and _team_name_matches_event(e, team):
-                        events.append(e)
+def espn_team_events(team: TeamRef, n=20) -> list[dict]:
+    # Primary path: one team, all competitions. This is the route that the live
+    # debug endpoint confirmed returns a populated schedule.
+    events = espn_all_schedule_events(team, n)
+    if len(events) >= min(n, 5):
+        return events
 
-            events = _dedupe_events(events)
-            if len(events) >= max(n, 10):
-                break
+    # Secondary fallback: all-soccer scoreboards by year. Do not rely on the
+    # competition-specific /teams/{id}/schedule routes that returned 403.
+    now = datetime.now()
+    fallback = list(events)
 
-    return _dedupe_events(events)[:max(n, 30)]
+    for year in range(now.year, now.year - 5, -1):
+        start_date = datetime(year, 1, 1)
+        end_date = now if year == now.year else datetime(year, 12, 31)
+
+        try:
+            data = http_json(
+                f"{ESPN_BASE}/all/scoreboard",
+                params={
+                    "dates": f"{start_date:%Y%m%d}-{end_date:%Y%m%d}",
+                    "limit": 1000,
+                },
+            )
+        except RuntimeError:
+            continue
+
+        for raw in data.get("events") or []:
+            e = parse_espn_event(raw, "ESPN Soccer")
+            if e and _team_name_matches_event(e, team):
+                fallback.append(e)
+
+        fallback = _dedupe_events(fallback)
+        if len(fallback) >= n:
+            break
+
+    return _dedupe_events(fallback)[:max(n, 30)]
 
 
 # -----------------------------
@@ -514,7 +590,7 @@ def tsdb_team_events(team: TeamRef, n=20) -> list[dict]:
 
             if len(events) >= n:
                 break
-        if len(events) >= n:
+        if len(events) >= n or (ref.provider == "espn" and len(events) >= 5):
             break
 
     events.sort(key=lambda x: x.get("date") or "", reverse=True)
@@ -1082,8 +1158,13 @@ def debug_team(team_name: str):
 
     tests = []
 
-    # Test competition-scoped schedule paths. Some ESPN namespaces may return
-    # 403; that is diagnostic information, not a fatal application error.
+    # Test the v5.3 guessed all-competition route as a diagnostic only.
+    tests.append({
+        "name": "all-web-no-season",
+        **debug_get(f"{ESPN_WEB_BASE}/all/teams/{resolved.id}/schedule"),
+    })
+
+    # Test the documented competition-scoped schedule path.
     for league in leagues:
         for season in (current_year, current_year - 1, current_year - 2):
             row = debug_get(
@@ -1124,8 +1205,8 @@ def debug_team(team_name: str):
         "schedule_tests": tests,
         "namespace_tests": namespace_tests,
         "instructions": (
-            "Look for schedule_tests with status=200 and events_count>0. "
-            "Those league slugs should be used by the production history collector."
+            "The production collector now prioritizes the all-competitions "
+            "team schedule and parses competition-level status/score objects."
         ),
     }
 
@@ -1140,7 +1221,7 @@ def health():
     return {
         "ok": True,
         "app": APP_NAME,
-        "version": "5.4",
+        "version": "5.5",
         "providers": {
             "football-data": bool(FOOTBALL_DATA_API_KEY),
             "espn": True,
@@ -1242,8 +1323,9 @@ def analyze(req: AnalyzeRequest):
             "source_away": away.provider,
             "football_data_enabled": bool(FOOTBALL_DATA_API_KEY),
             "note": (
-                "v5.4 provider router: football-data.org when configured, then ESPN "
-                "competition scoreboards/schedules, TheSportsDB, then FotMob fallback."
+                "v5.5 provider router: football-data.org when configured, then ESPN "
+                "all-competitions team schedule with schedule-compatible parser, "
+                "TheSportsDB, then FotMob fallback."
             ),
         },
     }
