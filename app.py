@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-APP_NAME = "Football Edge v5.6"
+APP_NAME = "Football Edge v6 Dynamic Resolver"
 BASE_DIR = Path(__file__).resolve().parent
 
 THESPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json/123"
@@ -65,7 +65,7 @@ UA = (
 CACHE: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 600
 
-app = FastAPI(title=APP_NAME, version="5.6")
+app = FastAPI(title=APP_NAME, version="6.0")
 
 
 class AnalyzeRequest(BaseModel):
@@ -162,11 +162,7 @@ def recursive_dicts(obj: Any):
 # ESPN public soccer API
 # -----------------------------
 
-ESPN_KNOWN = {
-    "denmark": TeamRef("479", "Denmark", "espn", [], {"league": "all"}),
-    "norway": TeamRef("464", "Norway", "espn", [], {"league": "all"}),
-    "spain": TeamRef("164", "Spain", "espn", [], {"league": "all"}),
-}
+ESPN_KNOWN: dict[str, TeamRef] = {}
 
 
 def _espn_team_rows(payload: Any):
@@ -185,11 +181,144 @@ def _espn_team_rows(payload: Any):
     return [r for r in rows if isinstance(r, dict)]
 
 
-def espn_search_team(query: str) -> TeamRef | None:
-    known = ESPN_KNOWN.get(norm(query))
-    if known:
-        return known
+def _espn_global_search_candidates(query: str) -> list[tuple[float, TeamRef]]:
+    """Resolve arbitrary soccer teams through ESPN's global search API."""
+    try:
+        data = http_json(
+            "https://site.web.api.espn.com/apis/common/v3/search",
+            params={
+                "query": query,
+                "limit": 50,
+                "mode": "prefix",
+                "region": "us",
+                "lang": "en",
+            },
+        )
+    except RuntimeError:
+        return []
 
+    items = data.get("items") or []
+    candidates: list[tuple[float, TeamRef]] = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        raw_type = str(
+            item.get("type")
+            or item.get("contentType")
+            or item.get("resultType")
+            or ""
+        ).casefold()
+        sport = str(
+            item.get("sport")
+            or item.get("sportSlug")
+            or item.get("sportName")
+            or ""
+        ).casefold()
+
+        # ESPN search can return news, athletes, leagues and teams together.
+        # Keep team-like soccer entries; unknown type is accepted only when the
+        # payload clearly contains a team id/name and soccer context.
+        team_like = (
+            raw_type in ("team", "teams", "club", "nationalteam", "national team")
+            or "team" in raw_type
+        )
+        soccer_like = sport in ("soccer", "football") or "soccer" in sport
+
+        # Some search results carry sport/league information inside nested fields.
+        league_obj = item.get("league")
+        if isinstance(league_obj, dict):
+            league_slug = (
+                league_obj.get("slug")
+                or league_obj.get("abbreviation")
+                or league_obj.get("name")
+            )
+        else:
+            league_slug = (
+                item.get("leagueSlug")
+                or item.get("defaultLeagueSlug")
+                or league_obj
+            )
+
+        display = (
+            item.get("displayName")
+            or item.get("name")
+            or item.get("shortDisplayName")
+            or item.get("title")
+        )
+        raw_id = (
+            item.get("id")
+            or item.get("teamId")
+            or item.get("entityId")
+            or item.get("uid")
+        )
+
+        if raw_id is None or not display:
+            continue
+
+        # If the API identifies the object as a team but omits the sport field,
+        # allow it and rely on the later schedule call for validation.
+        if raw_type and not team_like:
+            continue
+        if sport and not soccer_like:
+            continue
+
+        aliases = [
+            display,
+            item.get("shortDisplayName"),
+            item.get("abbreviation"),
+            item.get("location"),
+            item.get("slug"),
+        ]
+        score = max([sim(query, x) for x in aliases if x] or [0])
+
+        # Exact/near exact names should dominate; low similarity is rejected.
+        if score < .52:
+            continue
+
+        candidates.append((
+            score,
+            TeamRef(
+                str(raw_id),
+                str(display),
+                "espn",
+                [],
+                {
+                    "league": str(league_slug or "all"),
+                    "resolver": "espn-global-search",
+                },
+            ),
+        ))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates
+
+
+def espn_search_team(query: str) -> TeamRef | None:
+    # 1) Dynamic global ESPN search — no hard-coded team IDs.
+    candidates = _espn_global_search_candidates(query)
+    if candidates:
+        # Validate the leading candidates by checking whether ESPN exposes a
+        # team schedule. This prevents similarly named news/entities winning.
+        for _, ref in candidates[:6]:
+            try:
+                data = http_json(f"{ESPN_BASE}/all/teams/{ref.id}/schedule")
+                if isinstance(data.get("events"), list):
+                    return ref
+            except RuntimeError:
+                try:
+                    data = http_json(f"{ESPN_WEB_BASE}/all/teams/{ref.id}/schedule")
+                    if isinstance(data.get("events"), list):
+                        return ref
+                except RuntimeError:
+                    pass
+
+        # If validation endpoints are temporarily blocked, keep the best
+        # team-search result and let provider fallback handle data retrieval.
+        return candidates[0][1]
+
+    # 2) ESPN all-soccer team catalogue when available.
     def score_rows(rows, league="all"):
         scored = []
         for t in rows:
@@ -206,13 +335,17 @@ def espn_search_team(query: str) -> TeamRef | None:
             if raw_id is not None and name and score >= .52:
                 scored.append((
                     score,
-                    TeamRef(str(raw_id), str(name), "espn", [], {"league": league}),
+                    TeamRef(
+                        str(raw_id),
+                        str(name),
+                        "espn",
+                        [],
+                        {"league": league, "resolver": "espn-team-catalogue"},
+                    ),
                 ))
         scored.sort(key=lambda x: x[0], reverse=True)
         return scored
 
-    # First try ESPN's all-soccer namespace. This avoids needing to know the
-    # team's competition before we know the team itself.
     try:
         data = http_json(f"{ESPN_BASE}/all/teams")
         scored = score_rows(_espn_team_rows(data), "all")
@@ -221,7 +354,8 @@ def espn_search_team(query: str) -> TeamRef | None:
     except RuntimeError:
         pass
 
-    # Fallback for installations where /all/teams is restricted.
+    # 3) Last ESPN fallback: known competition catalogues. This is not a
+    # hard-coded team list; it dynamically scans team lists.
     best = None
     for league in ESPN_LEAGUES:
         try:
@@ -591,7 +725,7 @@ def tsdb_team_events(team: TeamRef, n=20) -> list[dict]:
 
             if len(events) >= n:
                 break
-        if len(events) >= n or (ref.provider == "espn" and len(events) >= 5):
+        if len(events) >= n:
             break
 
     events.sort(key=lambda x: x.get("date") or "", reverse=True)
@@ -1149,8 +1283,7 @@ def debug_team(team_name: str):
       /api/debug-team/Norway
     """
     q = team_name.strip()
-    known = ESPN_KNOWN.get(norm(q))
-    resolved = known or espn_search_team(q)
+    resolved = espn_search_team(q)
 
     if not resolved:
         return {
@@ -1161,7 +1294,8 @@ def debug_team(team_name: str):
         }
 
     current_year = datetime.now().year
-    leagues = ESPN_NATIONAL_LEAGUES if norm(resolved.name) in ESPN_KNOWN else ESPN_LEAGUES
+    resolved_league = (resolved.alt_ids or {}).get("league", "all")
+    leagues = ESPN_NATIONAL_LEAGUES if resolved_league in ESPN_NATIONAL_LEAGUES else ESPN_LEAGUES
 
     tests = []
 
@@ -1197,10 +1331,7 @@ def debug_team(team_name: str):
         "ok": True,
         "query": q,
         "resolved": asdict(resolved),
-        "expected_known_ids": {
-            "Denmark": "479",
-            "Norway": "464",
-        },
+        "resolver_mode": "dynamic",
         "successful_schedule_tests": [
             {
                 "name": x["name"],
@@ -1242,7 +1373,7 @@ def health():
     return {
         "ok": True,
         "app": APP_NAME,
-        "version": "5.6",
+        "version": "6.0",
         "providers": {
             "football-data": bool(FOOTBALL_DATA_API_KEY),
             "espn": True,
@@ -1307,6 +1438,8 @@ def analyze(req: AnalyzeRequest):
                 f" 目前 {home.name} {len(hr)} 場、{away.name} {len(ar)} 場。"
                 f" 主隊來源：{_diag_text(home_diag)}；"
                 f"客隊來源：{_diag_text(away_diag)}。"
+                f" 自動解析：{home.name}({home.provider}:{home.id}) / "
+                f"{away.name}({away.provider}:{away.id})。"
             ),
         )
 
@@ -1361,8 +1494,9 @@ def analyze(req: AnalyzeRequest):
             "source_away": away.provider,
             "football_data_enabled": bool(FOOTBALL_DATA_API_KEY),
             "note": (
-                "v5.6 stable provider router: provider failures are isolated, "
-                "ESPN all-competitions schedule is primary, then TheSportsDB and FotMob fallback."
+                "v6 Dynamic Resolver: arbitrary team names are resolved dynamically through "
+                "ESPN global search/team catalogues, then schedules are fetched automatically. "
+                "TheSportsDB, FotMob and football-data.org remain provider fallbacks."
             ),
         },
     }
