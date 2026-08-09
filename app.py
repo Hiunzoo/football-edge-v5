@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-APP_NAME = "Football Edge v5.3"
+APP_NAME = "Football Edge v5.3-debug"
 BASE_DIR = Path(__file__).resolve().parent
 
 THESPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json/123"
@@ -65,7 +65,7 @@ UA = (
 CACHE: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 600
 
-app = FastAPI(title=APP_NAME, version="5.3")
+app = FastAPI(title=APP_NAME, version="5.3-debug")
 
 
 class AnalyzeRequest(BaseModel):
@@ -1033,6 +1033,145 @@ def model_prediction(hs, aas, hv, av, h2h):
     }
 
 
+# -----------------------------
+# ESPN diagnostics
+# -----------------------------
+
+def debug_get(url: str, params: dict | None = None) -> dict:
+    """Return raw HTTP diagnostics without raising FastAPI errors."""
+    params = params or {}
+    result = {
+        "url": url,
+        "params": params,
+        "status": None,
+        "content_type": None,
+        "json": False,
+        "keys": [],
+        "events_count": None,
+        "error": None,
+    }
+
+    try:
+        r = requests.get(
+            url,
+            params=params,
+            timeout=15,
+            headers={
+                "User-Agent": UA,
+                "Accept": "application/json,text/plain,*/*",
+            },
+        )
+        result["status"] = r.status_code
+        result["content_type"] = r.headers.get("content-type")
+
+        try:
+            data = r.json()
+            result["json"] = True
+            if isinstance(data, dict):
+                result["keys"] = list(data.keys())[:30]
+                events = data.get("events")
+                if isinstance(events, list):
+                    result["events_count"] = len(events)
+
+                # Small safe preview so we can understand alternate response shapes.
+                preview = {}
+                for key in (
+                    "name", "timestamp", "status", "season",
+                    "team", "requestedSeason", "league",
+                ):
+                    if key in data:
+                        preview[key] = data[key]
+                if preview:
+                    result["preview"] = preview
+            elif isinstance(data, list):
+                result["events_count"] = len(data)
+        except Exception as e:
+            result["error"] = f"non-json response: {type(e).__name__}; first100={r.text[:100]!r}"
+
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+
+    return result
+
+
+@app.get("/api/debug-team/{team_name}")
+def debug_team(team_name: str):
+    """Diagnose ESPN team resolution and league schedule endpoints.
+
+    Example:
+      /api/debug-team/Denmark
+      /api/debug-team/Norway
+    """
+    q = team_name.strip()
+    known = ESPN_KNOWN.get(norm(q))
+    resolved = known or espn_search_team(q)
+
+    if not resolved:
+        return {
+            "ok": False,
+            "query": q,
+            "message": "ESPN team resolution failed.",
+            "known_team": None,
+        }
+
+    current_year = datetime.now().year
+    leagues = ESPN_NATIONAL_LEAGUES if norm(resolved.name) in ESPN_KNOWN else ESPN_LEAGUES
+
+    tests = []
+
+    # Test the v5.3 guessed all-competition route as a diagnostic only.
+    tests.append({
+        "name": "all-web-no-season",
+        **debug_get(f"{ESPN_WEB_BASE}/all/teams/{resolved.id}/schedule"),
+    })
+
+    # Test the documented competition-scoped schedule path.
+    for league in leagues:
+        for season in (current_year, current_year - 1, current_year - 2):
+            row = debug_get(
+                f"{ESPN_BASE}/{league}/teams/{resolved.id}/schedule",
+                {"season": season},
+            )
+            row["name"] = f"{league} / {season}"
+            tests.append(row)
+
+    # Also test teams listing, to see whether the ID exists in each namespace.
+    namespace_tests = []
+    for league in leagues:
+        data = debug_get(f"{ESPN_BASE}/{league}/teams")
+        data["name"] = f"{league} teams"
+        namespace_tests.append(data)
+
+    successful = [
+        x for x in tests
+        if x.get("status") == 200 and (x.get("events_count") or 0) > 0
+    ]
+
+    return {
+        "ok": True,
+        "query": q,
+        "resolved": asdict(resolved),
+        "expected_known_ids": {
+            "Denmark": "479",
+            "Norway": "464",
+        },
+        "successful_schedule_tests": [
+            {
+                "name": x["name"],
+                "events_count": x["events_count"],
+                "status": x["status"],
+            }
+            for x in successful
+        ],
+        "schedule_tests": tests,
+        "namespace_tests": namespace_tests,
+        "instructions": (
+            "Look for schedule_tests with status=200 and events_count>0. "
+            "Those league slugs should be used by the production history collector."
+        ),
+    }
+
+
 @app.get("/")
 def index():
     return FileResponse(BASE_DIR / "static" / "index.html")
@@ -1043,7 +1182,7 @@ def health():
     return {
         "ok": True,
         "app": APP_NAME,
-        "version": "5.3",
+        "version": "5.3-debug",
         "providers": {
             "football-data": bool(FOOTBALL_DATA_API_KEY),
             "espn": True,
