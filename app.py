@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-APP_NAME = "Football Edge v9 Global Strength"
+APP_NAME = "Football Edge v10 Calibrated Strength"
 BASE_DIR = Path(__file__).resolve().parent
 
 THESPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json/123"
@@ -68,7 +68,7 @@ UA = (
 CACHE: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 600
 
-app = FastAPI(title=APP_NAME, version="9.0")
+app = FastAPI(title=APP_NAME, version="10.0")
 
 
 class AnalyzeRequest(BaseModel):
@@ -1520,6 +1520,81 @@ def team_power_rating(events, team):
     }
 
 
+
+def elo_1x2_prior(home_strength, away_strength, home_advantage=35.0):
+    """Conservative 1X2 prior derived from verified long-term strength.
+
+    Elo normally predicts a non-draw expected score. We turn that into 1X2 by
+    allocating a draw probability that shrinks as the strength gap grows.
+    """
+    if not home_strength or not away_strength:
+        return None
+    if not (home_strength.get("verified") and away_strength.get("verified")):
+        return None
+
+    hd = float(home_strength["rating"])
+    ad = float(away_strength["rating"])
+    diff = clamp(hd - ad + home_advantage, -600.0, 600.0)
+
+    expected_home = 1.0 / (1.0 + 10.0 ** (-diff / 400.0))
+
+    # Football draw prior: highest near parity, lower for large mismatches.
+    draw = 0.29 - min(abs(diff) / 900.0, 0.11)
+    draw = clamp(draw, 0.18, 0.29)
+
+    decisive = 1.0 - draw
+    home = decisive * expected_home
+    away = decisive * (1.0 - expected_home)
+
+    return {"home": home, "draw": draw, "away": away, "elo_diff": diff}
+
+
+def calibrate_1x2(poisson_probs, home_strength, away_strength, sample_quality):
+    """Blend goal-model probabilities with a verified long-term-strength prior.
+
+    The Poisson/Dixon-Coles model remains the majority vote. Verified Elo acts
+    as a stabilizer so a short hot/cold streak cannot completely overturn a
+    large established strength gap.
+    """
+    prior = elo_1x2_prior(home_strength, away_strength)
+    if not prior:
+        return {
+            "home": poisson_probs["home"],
+            "draw": poisson_probs["draw"],
+            "away": poisson_probs["away"],
+            "elo_prior": None,
+            "poisson_weight": 1.0,
+            "elo_weight": 0.0,
+        }
+
+    # More data => trust match/xG model more. Sparse samples => lean more on Elo.
+    q = clamp(sample_quality, 0.0, 1.0)
+    poisson_w = 0.56 + 0.16 * q       # 0.56 ~ 0.72
+    elo_w = 1.0 - poisson_w           # 0.44 ~ 0.28
+
+    h = poisson_w * poisson_probs["home"] + elo_w * prior["home"]
+    d = poisson_w * poisson_probs["draw"] + elo_w * prior["draw"]
+    a = poisson_w * poisson_probs["away"] + elo_w * prior["away"]
+
+    s = h + d + a
+    return {
+        "home": h / s,
+        "draw": d / s,
+        "away": a / s,
+        "elo_prior": prior,
+        "poisson_weight": poisson_w,
+        "elo_weight": elo_w,
+    }
+
+
+def data_quality_score(home_count, away_count, home_strength, away_strength):
+    sample = clamp(min(home_count, away_count) / 10.0, 0.0, 1.0)
+    verified = (
+        bool(home_strength and home_strength.get("verified"))
+        + bool(away_strength and away_strength.get("verified"))
+    ) / 2.0
+    return clamp(0.60 * sample + 0.40 * verified, 0.0, 1.0)
+
 def poisson(k, lam):
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
@@ -1569,7 +1644,7 @@ def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None, hom
     # Long-term/global strength is the anchor; recent form is already blended into
     # home_strength / away_strength and only nudges the prior.
     elo_diff = 0.0
-    home_advantage_elo = 55.0
+    home_advantage_elo = 35.0
     effective_diff = home_advantage_elo
     elo_factor = 1.0
     strength_anchor_weight = 0.0
@@ -1648,6 +1723,22 @@ def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None, hom
     cells = [(p / mass, h, a) for p, h, a in cells]
     hp, dp, ap, over, btts = [x / mass for x in (hp, dp, ap, over, btts)]
     cells.sort(reverse=True)
+
+    sample_quality = data_quality_score(
+        hs.get("played", 0),
+        aas.get("played", 0),
+        home_strength,
+        away_strength,
+    )
+    calibrated = calibrate_1x2(
+        {"home": hp, "draw": dp, "away": ap},
+        home_strength,
+        away_strength,
+        sample_quality,
+    )
+    hp_cal = calibrated["home"]
+    dp_cal = calibrated["draw"]
+    ap_cal = calibrated["away"]
 
     top10 = [
         {"home": h, "away": a, "probability": round(p * 100, 1)}
@@ -1765,6 +1856,22 @@ def model_prediction(hs, aas, hv, av, h2h, home_power=None, away_power=None, hom
                 "ppg_edge": round(ppg_edge, 3),
             },
             "h2h_matches_used": min(len(h2h), 5),
+            "calibration": {
+                "raw_poisson": {
+                    "home": round(hp, 4),
+                    "draw": round(dp, 4),
+                    "away": round(ap, 4),
+                },
+                "elo_prior": calibrated["elo_prior"],
+                "poisson_weight": round(calibrated["poisson_weight"], 3),
+                "elo_weight": round(calibrated["elo_weight"], 3),
+                "data_quality": round(sample_quality, 3),
+                "final": {
+                    "home": round(hp_cal, 4),
+                    "draw": round(dp_cal, 4),
+                    "away": round(ap_cal, 4),
+                },
+            },
         },
     }
 
@@ -2025,7 +2132,7 @@ def health():
     return {
         "ok": True,
         "app": APP_NAME,
-        "version": "9.0",
+        "version": "10.0",
         "providers": {
             "football-data": bool(FOOTBALL_DATA_API_KEY),
             "espn": True,
@@ -2159,6 +2266,6 @@ def analyze(req: AnalyzeRequest):
             "source_home": home.provider,
             "source_away": away.provider,
             "football_data_enabled": bool(FOOTBALL_DATA_API_KEY),
-            "note": ("v9 uses team-specific World Football Elo pages for national teams, ClubElo for clubs, and makes verified global strength the primary xG allocation anchor."),
+            "note": ("v10 calibrates Dixon-Coles/Poisson 1X2 probabilities against verified Global Elo, adapts weighting to sample quality, and lowers confidence when long-term strength or match data are weak."),
         },
     }
