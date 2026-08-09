@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Football Edge v8</title>
+<title>Football Edge v8.1</title>
 <style>
 :root{--bg:#07111d;--panel:#0d1c2b;--line:#20384f;--text:#f4f8fc;--muted:#91a8bd;--green:#31db8b;--blue:#63a8ff;--amber:#ffc45e}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,#15304b 0,#07111d 38%);color:var(--text);font-family:Inter,"Noto Sans TC","Segoe UI",sans-serif}
@@ -29,7 +29,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;border-bottom:1
 </head>
 <body>
 <main class="wrap">
-<div class="top"><div class="brand">Football <span>Edge v8</span></div><div class="badge">GLOBAL ELO HYBRID v8</div></div>
+<div class="top"><div class="brand">Football <span>Edge v8.1</span></div><div class="badge">DIAGNOSTIC MODEL v8.1</div></div>
 <h1>輸入兩隊，直接做完整賽前分析。</h1>
 <div class="sub">支援俱樂部與國家隊。伺服器會自動搜尋球隊、抓近期賽果與歷史交手，再用主客場權重與 Dixon–Coles Poisson 模型計算勝平負與最可能比分。</div>
 
@@ -40,7 +40,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;border-bottom:1
   <select id="recent"><option value="5">近 5 場</option><option value="10" selected>近 10 場</option><option value="15">近 15 場</option><option value="20">近 20 場</option></select>
   <button id="analyze">開始分析</button>
 </div>
-<div class="hint">輸入常用隊名即可，例如 Liverpool、Man City、PSG；系統會自動比對正式球隊名稱；v8 以全球 Elo 當長期實力地基，再用近期狀態與對手強度微調，避免短期連勝把弱隊錯估成世界級強隊。<br>v8 會自動解析球隊，跨 ESPN、TheSportsDB、FotMob 與可用正式 API 收集多年度賽事，合併去重後取真正最近場次。</div>
+<div class="hint">輸入常用隊名即可，例如 Liverpool、Man City、PSG；系統會自動比對正式球隊名稱；v8.1 會直接顯示 Global Elo 是否成功取得、Hybrid Rating、主場加成，以及 xG 在各階段的變化，方便檢查模型是否真的使用到長期實力。<br>v8 會自動解析球隊，跨 ESPN、TheSportsDB、FotMob 與可用正式 API 收集多年度賽事，合併去重後取真正最近場次。</div>
 <div id="status" class="status"></div>
 
 <div id="results" class="hidden">
@@ -75,6 +75,25 @@ table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;border-bottom:1
     <div class="card"><div class="muted">客隊 Hybrid Rating</div><div class="big" id="globalAway">--</div><small id="globalAwaySrc"></small></div>
   </div>
 </section>
+
+<section class="section">
+  <div class="sectionhead">
+    <h2>模型診斷</h2>
+    <small>確認 Elo 是否成功套用，以及 xG 在每一層如何變化</small>
+  </div>
+  <div class="grid four">
+    <div class="card"><div class="muted">主隊 Global Elo</div><div class="big" id="diagGlobalHome">--</div><small id="diagHomeSource">--</small></div>
+    <div class="card"><div class="muted">客隊 Global Elo</div><div class="big" id="diagGlobalAway">--</div><small id="diagAwaySource">--</small></div>
+    <div class="card"><div class="muted">Hybrid 差（主－客）</div><div class="big" id="diagHybridDiff">--</div><small>未含主場</small></div>
+    <div class="card"><div class="muted">主場加成 Elo</div><div class="big" id="diagHomeAdv">--</div><small>目前模型設定</small></div>
+  </div>
+  <div class="grid four" style="margin-top:12px">
+    <div class="card"><div class="muted">原始 xG</div><div class="big" id="diagRawXg">--</div></div>
+    <div class="card"><div class="muted">近期狀態後 xG</div><div class="big" id="diagFormXg">--</div></div>
+    <div class="card"><div class="muted">Elo 校正後 xG</div><div class="big" id="diagEloXg">--</div></div>
+    <div class="card"><div class="muted">最終 xG</div><div class="big" id="diagFinalXg">--</div></div>
+  </div>
+</section>
 <h2>Top 10 比分</h2><small>單一比分機率通常不高</small></div><div class="top10" id="top10"></div></section>
 
   <section class="section"><div class="sectionhead"><h2>歷史交戰</h2><small id="h2hCount"></small></div><div class="card tablewrap"><table><thead><tr><th>日期</th><th>賽事</th><th>主隊</th><th>比分</th><th>客隊</th></tr></thead><tbody id="h2hRows"></tbody></table></div></section>
@@ -84,7 +103,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;border-bottom:1
   <section class="section"><div id="summary" class="callout"></div><div class="callout warn">模型是統計估計，不代表確定比分。先發、傷停、紅牌、賽程與戰術變化都可能改變結果。</div></section>
 </div>
 
-<div class="footer">Football Edge v8 · FotMob public web JSON adapter · non-official data source</div>
+<div class="footer">Football Edge v8.1 · FotMob public web JSON adapter · non-official data source</div>
 </main>
 
 <script>
@@ -180,6 +199,20 @@ function render(d){
     $("globalDiff").textContent=(p.strength.difference>0?"+":"")+(p.strength.difference ?? "--");
     $("globalHomeSrc").textContent=p.strength.home?.source || "";
     $("globalAwaySrc").textContent=p.strength.away?.source || "";
+  }
+  if(p.diagnostic && $("diagGlobalHome")){
+    const dg=p.diagnostic;
+    const e=dg.elo||{};
+    $("diagGlobalHome").textContent=e.home_global_elo ?? "未取得";
+    $("diagGlobalAway").textContent=e.away_global_elo ?? "未取得";
+    $("diagHomeSource").textContent=(e.home_source||"--")+(e.home_external?" ✓":" ⚠ fallback");
+    $("diagAwaySource").textContent=(e.away_source||"--")+(e.away_external?" ✓":" ⚠ fallback");
+    $("diagHybridDiff").textContent=(e.rating_difference>0?"+":"")+(e.rating_difference ?? "--");
+    $("diagHomeAdv").textContent=e.home_advantage ?? "--";
+    $("diagRawXg").textContent=`${dg.raw_xg?.home ?? "--"} / ${dg.raw_xg?.away ?? "--"}`;
+    $("diagFormXg").textContent=`${dg.after_recent_form_xg?.home ?? "--"} / ${dg.after_recent_form_xg?.away ?? "--"}`;
+    $("diagEloXg").textContent=`${dg.after_elo_xg?.home ?? "--"} / ${dg.after_elo_xg?.away ?? "--"}`;
+    $("diagFinalXg").textContent=`${dg.final_xg?.home ?? "--"} / ${dg.final_xg?.away ?? "--"}`;
   }
   const best=p.top_scores[0];
   const q=p.sample_quality==="normal"?"正常":(p.sample_quality==="medium"?"中等":"偏低");
