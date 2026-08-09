@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Football Edge v5.2</title>
+<title>Football Edge v6.1.2</title>
 <style>
 :root{--bg:#07111d;--panel:#0d1c2b;--line:#20384f;--text:#f4f8fc;--muted:#91a8bd;--green:#31db8b;--blue:#63a8ff;--amber:#ffc45e}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,#15304b 0,#07111d 38%);color:var(--text);font-family:Inter,"Noto Sans TC","Segoe UI",sans-serif}
@@ -29,7 +29,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;border-bottom:1
 </head>
 <body>
 <main class="wrap">
-<div class="top"><div class="brand">Football <span>Edge v5</span></div><div class="badge">MULTI-SOURCE ENGINE v5.2</div></div>
+<div class="top"><div class="brand">Football <span>Edge v5</span></div><div class="badge">UNIVERSAL COLLECTOR v6.1</div></div>
 <h1>輸入兩隊，直接做完整賽前分析。</h1>
 <div class="sub">支援俱樂部與國家隊。伺服器會自動搜尋球隊、抓近期賽果與歷史交手，再用主客場權重與 Dixon–Coles Poisson 模型計算勝平負與最可能比分。</div>
 
@@ -40,7 +40,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;border-bottom:1
   <select id="recent"><option value="5">近 5 場</option><option value="10" selected>近 10 場</option><option value="15">近 15 場</option><option value="20">近 20 場</option></select>
   <button id="analyze">開始分析</button>
 </div>
-<div class="hint">v5.2 會跨 Nations League、世界盃資格賽、EURO、友誼賽等賽事合併近期紀錄；資料不足時會降低模型信心，而不是直接要求一定滿 10 場。</div>
+<div class="hint">v6.1 會自動解析球隊，跨 ESPN、TheSportsDB、FotMob 與可用正式 API 收集多年度賽事，合併去重後取真正最近場次。</div>
 <div id="status" class="status"></div>
 
 <div id="results" class="hidden">
@@ -75,7 +75,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;border-bottom:1
   <section class="section"><div id="summary" class="callout"></div><div class="callout warn">模型是統計估計，不代表確定比分。先發、傷停、紅牌、賽程與戰術變化都可能改變結果。</div></section>
 </div>
 
-<div class="footer">Football Edge v5.2 · FotMob public web JSON adapter · non-official data source</div>
+<div class="footer">Football Edge v6.1.2 · FotMob public web JSON adapter · non-official data source</div>
 </main>
 
 <script>
